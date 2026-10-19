@@ -1143,6 +1143,74 @@ class TestMitmProxy(unittest.TestCase):
                 echo.close()
 
 
+class TestModeSelection(unittest.TestCase):
+    def test_capture_flags_used(self):
+        p = nl.build_parser()
+        self.assertFalse(nl._capture_flags_used(p.parse_args([])))
+        self.assertTrue(nl._capture_flags_used(p.parse_args(["--pcap", "x.pcap"])))
+        self.assertTrue(nl._capture_flags_used(p.parse_args(["-i", "eth0"])))
+        self.assertTrue(nl._capture_flags_used(p.parse_args(["--dns"])))
+        self.assertFalse(nl._capture_flags_used(p.parse_args(["--min-size", "1M"])))
+
+    def _patched_run(self, extra):
+        saved = (
+            nl.install_ca, nl.ca_trusted_anywhere,
+            nl.set_system_proxy, nl.restore_system_proxy,
+        )
+        log = {"install": [], "system": [], "restore": 0}
+        state = {"trusted": False}
+
+        def fake_trusted(_ca):
+            return state["trusted"]
+
+        def fake_install(_ca, _color, remove=False, stream=None):
+            log["install"].append(remove)
+            state["trusted"] = not remove
+            return 0
+
+        def fake_set(ca_dir, host, port):
+            log["system"].append((host, port))
+            return os.path.join(ca_dir, "proxy-state.json"), True
+
+        def fake_restore(_ca_dir, _color=None, stream=None):
+            log["restore"] += 1
+            return True
+
+        nl.install_ca = fake_install
+        nl.ca_trusted_anywhere = fake_trusted
+        nl.set_system_proxy = fake_set
+        nl.restore_system_proxy = fake_restore
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                rc = nl.main(["--mitm-port", "0", "--duration", "1", "-q",
+                              "--mitm-ca-dir", td, *extra])
+        finally:
+            (nl.install_ca, nl.ca_trusted_anywhere,
+             nl.set_system_proxy, nl.restore_system_proxy) = saved
+        return rc, log
+
+    def test_default_run_auto_trusts_and_restores(self):
+        rc, log = self._patched_run([])
+        self.assertEqual(rc, 0)
+        self.assertEqual(log["install"], [False, True])   # installed, then removed
+        self.assertEqual(len(log["system"]), 1)
+        self.assertEqual(log["system"][0][0], "127.0.0.1")
+        self.assertEqual(log["restore"], 1)
+
+    def test_no_ca_install_and_no_system_proxy(self):
+        rc, log = self._patched_run(["--no-ca-install", "--no-system-proxy"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(log["install"], [])
+        self.assertEqual(log["system"], [])
+        self.assertEqual(log["restore"], 0)
+
+    def test_command_mode_skips_auto_system_changes(self):
+        rc, log = self._patched_run(["--", "/bin/true"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(log["install"], [])
+        self.assertEqual(log["system"], [])
+
+
 class TestSystemProxy(unittest.TestCase):
     FAKE = '''#!/usr/bin/env python3
 import json, os, sys

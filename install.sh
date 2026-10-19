@@ -21,9 +21,15 @@ install -m 755 "$SRC_DIR/netlogger.py" "$BIN/netlogger"
 
 echo "installed: $BIN/netlogger"
 echo
-echo "run it with raw packet access, for example:"
+echo "full URLs for every app (default, needs sudo to trust the CA):"
 echo "    sudo $BIN/netlogger"
-echo "    sudo $BIN/netlogger --demo     # no root needed, actually"
+echo
+echo "raw packet-capture view instead (DNS, QUIC, every interface):"
+echo "    sudo $BIN/netlogger --capture"
+echo
+echo "no root needed for these:"
+echo "    $BIN/netlogger --demo"
+echo "    $BIN/netlogger --selftest"
 echo
 case ":$PATH:" in
     *":$BIN:"*) ;;

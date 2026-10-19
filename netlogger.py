@@ -1,38 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-netlogger — watch every fetch your apps make, live, in colour.
+netlogger — watch every fetch your apps make, with the full URL, live and in colour.
 
-A small Linux network logger.  It sniffs packets with a raw AF_PACKET socket,
-reassembles just enough TCP/UDP state, attributes every connection to the
-process that owns it (via /proc), recognises the application protocol
-(HTTP / WebSocket / TLS(SNI) / HTTP-2 / QUIC / DNS) and prints one colourful
-line per fetch:
+By default netlogger runs a local MITM proxy so even HTTPS requests show the
+complete path and query.  It builds its own CA (cryptography or the openssl CLI),
+trusts it for the duration of the run, and points GNOME's system proxy at itself
+so browsers and other apps are covered:
 
-    12:33:04 [GET  ] download.example.com/package1.zip - 12.6 MB  ↓12.6 MB ↑1.2 KB · 0.41s · 3.9 MB/s · curl(2381)
+    sudo ./netlogger.py                 # full-path proxy for everything, CA auto-trusted
+    ./netlogger.py -- curl https://example.com/file   # proxy just this one command
+    ./netlogger.py --no-system-proxy    # proxy only, leave the desktop proxy alone
+    sudo ./netlogger.py --no-ca-install # proxy without touching the trust stores
 
-Packet capture uses only the Python standard library, /proc, and no eBPF or
-libpcap.  Run it as root (or with CAP_NET_RAW) because raw sockets need it:
+Want the old raw-packet view (every interface, DNS, QUIC, no proxy)?  Use
+--capture; it needs root or CAP_NET_RAW and sees traffic that never goes through
+a proxy:
 
-    sudo ./netlogger.py                 # everything on every real interface
-    sudo ./netlogger.py -i wlan0        # one interface only
-    sudo ./netlogger.py --host '*.zip' --min-size 1M
-    sudo ./netlogger.py --dns --live
+    sudo ./netlogger.py --capture       # raw AF_PACKET sniffer on every interface
+    sudo ./netlogger.py --capture -i wlan0 --dns --live
     ./netlogger.py --demo               # pretty demo, no root needed
     ./netlogger.py --selftest           # parser self checks, no root needed
 
-TLS hides paths.  For full HTTPS URLs, run the built-in MITM proxy (no root,
-no mitmproxy install; it uses cryptography or the openssl CLI to make a local
-CA and per-host certificates):
-
-    ./netlogger.py --mitm               # proxy on 127.0.0.1:8080
-    ./netlogger.py --mitm -- curl https://example.com/file   # just this app
-    ./netlogger.py --mitm --mitm-system # point GNOME's system proxy at it
-    ./netlogger.py --mitm-ca-install    # trust the CA system-wide + browsers
-    ./netlogger.py --mitm-restore       # undo --mitm-system after a hard kill
-
-Apps with certificate pinning will refuse the MITM certificate; pass those
-hosts through untouched with --mitm-ignore.  The CA private key lives in
+Packet capture uses only the Python standard library, /proc, and no eBPF or
+libpcap.  The proxy speaks HTTP/1.1 (browsers fall back automatically); apps with
+certificate pinning refuse the MITM certificate — pass those hosts through
+untouched with --mitm-ignore.  The CA private key lives in
 ~/.config/netlogger/mitm and is sensitive.
 
 Author: built for you.  License: MIT.
@@ -67,7 +60,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 PROG = "netlogger"
 
 # --------------------------------------------------------------------------- #
@@ -2788,6 +2781,33 @@ def _session_prefix() -> List[str]:
     return []
 
 
+def ca_trusted_anywhere(ca: CertAuthority) -> bool:
+    """True if this exact CA is already trusted system-wide or in any NSS store."""
+    try:
+        with open(ca.cert_path, "rb") as fh:
+            cert = fh.read().strip()
+    except OSError:
+        return False
+    if not cert:
+        return False
+    anchor, _ = system_anchor()
+    if anchor and os.path.isfile(anchor):
+        try:
+            with open(anchor, "rb") as fh:
+                if fh.read().strip() == cert:
+                    return True
+        except OSError:
+            pass
+    if shutil.which("certutil"):
+        prefix = _session_prefix()
+        for db in nss_dirs():
+            code, out = _run_cmd(prefix + ["certutil", "-L", "-d", "sql:" + db],
+                                 capture=True, timeout=20)
+            if code == 0 and MITM_CA_NAME in out:
+                return True
+    return False
+
+
 def install_ca(ca: CertAuthority, color: Color, remove: bool = False,
                stream: Optional[Any] = None) -> int:
     sink = stream or sys.stdout
@@ -3712,6 +3732,21 @@ def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> in
         sys.stderr.write(f"[{PROG}] error: {exc}\n")
         return 2
 
+    command = [str(x) for x in (cfg.command or [])]
+    while command and command[0] == "--":
+        command.pop(0)
+    use_system = bool(cfg.mitm_system) or ((not cfg.no_system_proxy) and not command)
+    auto_ca = (not cfg.no_ca_install) and not command
+    ca_installed_here = False
+    already_trusted = ca_trusted_anywhere(ca) if auto_ca else False
+    if auto_ca and not already_trusted:
+        rc = install_ca(ca, color, stream=sys.stderr)
+        ca_installed_here = ca_trusted_anywhere(ca)
+        if not ca_installed_here:
+            sys.stderr.write(
+                f"[{PROG}] could not trust the CA automatically (rc {rc}); "
+                f"apps may refuse HTTPS\n")
+
     out: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
     proc = ProcMap()
     proxy = MitmProxy(cfg, ca, out, proc)
@@ -3732,6 +3767,8 @@ def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> in
         proxy.stop()
         if saved_state:
             restore_system_proxy(ca.dir, color, stream=sys.stderr)
+        if ca_installed_here:
+            install_ca(ca, color, remove=True, stream=sys.stderr)
 
     def on_signal(_signum: int, _frame: Any) -> None:
         if state["stop"]:
@@ -3744,7 +3781,7 @@ def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> in
     signal.signal(signal.SIGTERM, on_signal)
 
     env = mitm_env(ca, proxy.port, proxy.listen)
-    if cfg.mitm_system:
+    if use_system:
         proxy_host = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(
             proxy.listen, proxy.listen)
         saved_state, system_ok = set_system_proxy(ca.dir, proxy_host, proxy.port)
@@ -3755,11 +3792,13 @@ def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> in
 
     if not cfg.quiet:
         emitter.banner(f"MITM proxy on {env['https_proxy']} · CA {ca.cert_path}")
-        emitter.banner("no root needed · TLS is terminated locally · full paths are logged")
+        emitter.banner("TLS is terminated locally · full paths are logged")
+        if auto_ca and ca_installed_here:
+            emitter.banner("CA trusted system-wide — removed again when netlogger exits")
         emitter.banner("this shell:  export " +
                        " ".join(f"{k}={shlex.quote(v)}" for k, v in
                                 ((k, env[k]) for k in ("HTTPS_PROXY", "HTTP_PROXY", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"))))
-        if cfg.mitm_system:
+        if use_system:
             emitter.banner(f"if this process is killed hard: {PROG} --mitm-restore")
         if cfg.mitm_insecure:
             emitter.banner("warning: upstream TLS certificates are NOT verified (--mitm-insecure)")
@@ -3769,13 +3808,11 @@ def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> in
             emitter.banner("--pcap is ignored in MITM mode (no raw packets are captured)")
         emitter.banner("the CA private key is sensitive; undo trust with: " + f"{PROG} --mitm-ca-remove")
         emitter.banner("certificate pinning will make some apps refuse the connection")
-        if not cfg.command:
-            emitter.banner(f"other apps need the CA trusted: {PROG} --mitm-ca-install")
+        if not command and not ca_installed_here and not already_trusted:
+            emitter.banner(f"to trust the CA for other apps: {PROG} --mitm-ca-install")
+        if not command:
             emitter.banner("press Ctrl-C to stop")
 
-    command = [str(x) for x in (cfg.command or [])]
-    while command and command[0] == "--":
-        command.pop(0)
     deadline = time.time() + cfg.duration if cfg.duration > 0 else None
     last_stats = time.time()
     exit_code = 0
@@ -4129,45 +4166,48 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=PROG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=f"{PROG} {__version__} — see every fetch your apps make, live, in colour.",
+        description=f"{PROG} {__version__} — full URLs for every fetch: a local MITM "
+                    f"proxy by default, raw packet capture with --capture.",
         epilog="""\
 examples:
-  sudo netlogger.py                          capture everything, pretty output
-  sudo netlogger.py -i wlan0 -l              one interface, live "starting" lines
-  sudo netlogger.py --host '*.zip' --app curl
-  sudo netlogger.py --method GET,POST --min-size 1M
-  sudo netlogger.py -f json | jq .           machine readable
-  sudo netlogger.py -o fetches.csv -f csv    keep a spreadsheet friendly log
-  sudo netlogger.py --pcap dump.pcap         also save the raw frames
+  sudo netlogger.py                          full-path proxy for everything (default)
+  netlogger.py -- curl https://x/y           proxy just this one command
+  sudo netlogger.py --no-ca-install          proxy without touching the trust stores
+  sudo netlogger.py --no-system-proxy        proxy only, leave GNOME's proxy alone
+  netlogger.py --mitm-ca-show                show the CA path + fingerprint
+
+  sudo netlogger.py --capture                raw packet capture (the old default)
+  sudo netlogger.py --capture -i wlan0 -l    one interface, live "starting" lines
+  sudo netlogger.py --capture --host '*.zip' --app curl
+  sudo netlogger.py --capture -f json | jq . machine readable
+  sudo netlogger.py --capture --pcap dump.pcap   also save the raw frames
   netlogger.py --demo                        preview without root
   netlogger.py --selftest                    check the parsers
 
-  netlogger.py --mitm                        local proxy: full HTTPS URLs, no root
-  netlogger.py --mitm -- curl https://x/y    proxy one command (CA + env set)
-  netlogger.py --mitm --mitm-system          point GNOME's proxy at it
-  netlogger.py --mitm-ca-install             trust the CA (system + Firefox/Chrome)
-  netlogger.py --mitm-restore                undo --mitm-system after a hard kill
-
 badges:
-  GET/POST/PUT/…  HTTP method (plain HTTP, or HTTPS with --mitm)
+  GET/POST/PUT/…  HTTP method (full path in the default proxy mode)
   WS / WSS        websocket
   HTTPS           TLS session, host from SNI (path is encrypted)
   H2 / H3 / QUIC  HTTP/2 or HTTP/3
   CONN            a raw tunnel (CONNECT / SSH / ignored pinned host)
-  DNS             name lookup (only with --dns)
+  DNS             name lookup (capture mode with --dns)
   SSH/SMB/…       guessed from the port, shown for big enough flows
 
+modes:
+  Default (MITM proxy): netlogger terminates TLS locally with its own CA, so you
+  get the full URL, method, status and sizes. It trusts the CA for the run and
+  points GNOME's proxy at itself, then undoes both on exit. Apps that pin
+  certificates refuse the connection (use --mitm-ignore for those).
+
+  --capture: the raw AF_PACKET sniffer (needs root or CAP_NET_RAW). Without a
+  proxy, HTTPS paths cannot be seen — TLS hides them — but you get every
+  interface, DNS and QUIC traffic that never goes through the proxy.
+
 notes:
-  · Without --mitm, HTTPS paths cannot be seen — TLS hides them. You still get
-    the host (SNI), the bytes used and the owning process.
-  · With --mitm, netlogger terminates TLS locally with its own CA, so you get
-    the full URL, method, status and sizes. Apps that pin certificates will
-    refuse the connection (use --mitm-ignore for those).
   · traffic numbers count application payload (what the app sent/received),
     HTTP headers are included, IP/TCP framing is not.
-  · packet capture needs root or CAP_NET_RAW; --mitm needs no root. Virtual
-    bridge interfaces are skipped by default so packets seen on both eth0 and
-    docker0 are not counted twice.
+  · virtual bridge interfaces are skipped by default so packets seen on both
+    eth0 and docker0 are not counted twice.
 """)
     p.add_argument("-i", "--interface", action="append", metavar="IFACE",
                    help="capture only this interface (repeatable)")
@@ -4231,15 +4271,21 @@ notes:
                    help="print a one line running total to stderr every SECS")
     g.add_argument("--pcap", metavar="FILE", help="also write raw frames to a pcap file")
 
-    g = p.add_argument_group("MITM proxy — full URLs for HTTPS (no root needed)")
+    g = p.add_argument_group("modes and MITM proxy — full URLs for HTTPS")
+    g.add_argument("--capture", action="store_true",
+                   help="use the raw AF_PACKET sniffer (the pre-1.2 default) instead of the proxy")
     g.add_argument("--mitm", action="store_true",
-                   help="run a local TLS-terminating proxy: see full HTTPS URLs, methods and status")
+                   help="run the local TLS-terminating proxy (this is the default mode)")
     g.add_argument("--mitm-port", type=int, default=8080, metavar="PORT",
                    help="proxy port (default 8080; 0 = pick a free one)")
     g.add_argument("--mitm-listen", default="127.0.0.1", metavar="ADDR",
                    help="proxy listen address (default 127.0.0.1)")
-    g.add_argument("--mitm-system", action="store_true",
-                   help="also point GNOME's system proxy at it (restored on exit)")
+    g.add_argument("--mitm-system", action="store_true", default=None,
+                   help="point GNOME's system proxy at it (default: on when no command is given)")
+    g.add_argument("--no-system-proxy", action="store_true",
+                   help="do not touch GNOME's system proxy automatically")
+    g.add_argument("--no-ca-install", action="store_true",
+                   help="do not auto-install/remove the CA in the system and browser stores")
     g.add_argument("--mitm-restore", action="store_true",
                    help="restore the system proxy saved by --mitm-system, then exit")
     g.add_argument("--mitm-ca-install", action="store_true",
@@ -4266,7 +4312,7 @@ notes:
     g.add_argument("-v", "--verbose", action="store_true", help="more chatter on stderr")
     g.add_argument("-V", "--version", action="version", version=f"{PROG} {__version__}")
     p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- CMD",
-                   help="with --mitm: run CMD with the proxy environment and CA exported")
+                   help="run CMD with the proxy environment and CA exported (MITM mode only)")
     return p
 
 
@@ -4426,6 +4472,15 @@ def capture(cfg: argparse.Namespace, color: Color) -> int:
     return 0
 
 
+def _capture_flags_used(args: argparse.Namespace) -> bool:
+    """True when options that only affect the packet sniffer were given."""
+    return bool(
+        args.interface or args.all_ifaces or args.no_loopback or args.promisc
+        or args.force_hwtype or args.dns or args.all or args.pcap
+        or args.snaplen != 262144 or args.idle != 8.0
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -4448,16 +4503,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # nothing to restore is not an error; a state file we could not apply is
         return 0 if ok or not os.path.exists(proxy_state_path(ca.dir)) else 2
 
+    # MITM is the default mode; --capture brings back the raw packet sniffer.
+    # Passing capture-only flags without a mode also selects --capture.
+    capture_mode = bool(args.capture)
+    if not capture_mode and not args.mitm and _capture_flags_used(args):
+        capture_mode = True
+        if not args.quiet:
+            sys.stderr.write(
+                f"[{PROG}] packet-capture flags given: using --capture mode "
+                f"(add --mitm for full HTTPS paths)\n")
+    mitm_mode = not capture_mode
+    run_after = bool(args.mitm or args.command or args.mitm_system)
+    ca_stream = sys.stderr if mitm_mode and args.format in ("json", "csv") else None
+
     if args.mitm_ca_show:
-        show_ca(ca, color, stream=sys.stderr if args.mitm and args.format in ("json", "csv") else None)
-        if not args.mitm:
+        show_ca(ca, color, stream=ca_stream)
+        if not run_after:
             return 0
     if args.mitm_ca_reset:
         ca.reset()
-        reset_out = sys.stderr if args.mitm and args.format in ("json", "csv") else sys.stdout
+        reset_out = ca_stream or sys.stdout
         reset_out.write(f"[{PROG}] CA and cached leaf certificates removed from {ca.dir}\n")
         reset_out.write(f"[{PROG}] existing trust entries remain; remove them with --mitm-ca-remove\n")
-        if not (args.mitm or args.mitm_ca_install):
+        if not (run_after or args.mitm_ca_install):
             return 0
     if args.mitm_ca_install:
         try:
@@ -4465,24 +4533,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except RuntimeError as exc:
             sys.stderr.write(f"[{PROG}] error: {exc}\n")
             return 2
-        rc = install_ca(ca, color,
-                        stream=sys.stderr if args.mitm and args.format in ("json", "csv") else None)
-        if rc and not args.mitm:
+        rc = install_ca(ca, color, stream=ca_stream)
+        if not run_after:
             return rc
     if args.mitm_ca_remove:
-        rc = install_ca(ca, color, remove=True,
-                        stream=sys.stderr if args.mitm and args.format in ("json", "csv") else None)
-        if not args.mitm:
+        rc = install_ca(ca, color, remove=True, stream=ca_stream)
+        if not run_after:
             return rc
 
-    if args.command and not args.mitm:
-        parser.error("a command can only be run with --mitm (put flags before --)")
-    if args.mitm_system and not args.mitm:
-        parser.error("--mitm-system needs --mitm")
-    if args.mitm and not (0 <= args.mitm_port <= 65535):
-        parser.error("--mitm-port must be between 0 and 65535")
-    if args.mitm and args.mitm_timeout <= 0:
-        parser.error("--mitm-timeout must be > 0")
+    if capture_mode:
+        if args.command:
+            parser.error("a command can only be run with the MITM proxy (drop --capture)")
+    else:
+        if not (0 <= args.mitm_port <= 65535):
+            parser.error("--mitm-port must be between 0 and 65535")
+        if args.mitm_timeout <= 0:
+            parser.error("--mitm-timeout must be > 0")
 
     # a few sanity checks that would otherwise fail confusingly mid-capture
     try:
@@ -4492,7 +4558,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--duration/--count must be >= 0 and --idle > 0")
     if args.width and args.width < 40:
         parser.error("--width must be at least 40")
-    if args.mitm:
+    if mitm_mode:
         return mitm_capture(args, color, ca)
     return capture(args, color)
 
