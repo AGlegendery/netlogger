@@ -16,7 +16,7 @@ show their complete address:
 12:33:07 [WS   ] stream.example.com/live/feed?channel=7 - 296 KB  firefox(3311) · 101 · 12.40s
 12:33:08 [CONN ] pinned.example.com - 7085 B  app(6677) · pass-through (not decrypted)
 ──────────────────────────────────────────────────────────────────────────────
- netlogger 1.2.0 · 1.08s · 5 fetches
+ netlogger 1.3.0 · 1.08s · 5 fetches
  traffic   ↓ 14.3 MB   ↑ 815 KB   total 15.1 MB
  top apps  curl 12.6 MB · node(npm) 1.41 MB · firefox 296 KB · github 5.33 KB
  methods   GET 3 · POST 1 · WS 1 · CONN 1
@@ -101,6 +101,7 @@ Useful flags (see `--help` for all of them):
 | `--mitm` | the local TLS-terminating proxy (this is the default) |
 | `--no-ca-install` | don't auto-install/remove the CA in the trust stores |
 | `--no-system-proxy` | don't touch GNOME's system proxy automatically |
+| `--mitm-upstream URL` | forward upstream through another proxy (`http://`, `https://`, `socks5://`, `socks5h://`) — keeps your VPN in the loop |
 | `-i, --interface IFACE` | capture one interface (repeatable); capture mode |
 | `-l, --live` | print a line when a fetch starts, and its final size when it ends |
 | `--dns` | also show DNS lookups (capture mode) |
@@ -162,6 +163,37 @@ child automatically: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`,
 `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
 `GIT_SSL_CAINFO`, `PIP_CERT`. If you ran netlogger with `sudo`, the child is
 dropped back to your desktop user (Python 3.9+), so it does not run as root.
+
+### Using it with a VPN or a local proxy (xray, v2ray, clash, sing-box …)
+
+A very common setup is a local proxy (for example **xray** from v2rayN on
+`127.0.0.1:10808` SOCKS / `127.0.0.1:10809` HTTP) with the system proxy or the
+shell environment pointing at it. In that case netlogger sees **nothing**: your
+apps talk to the local proxy, not to netlogger, and `localhost` is in every
+`NO_PROXY` list. If netlogger *were* to catch the traffic it would forward
+upstream **directly**, so censored sites would not load.
+
+Chain the two instead — netlogger first, VPN second:
+
+```bash
+# apps/system proxy -> netlogger:8080 -> xray -> internet
+sudo ./netlogger.py --mitm-upstream socks5h://127.0.0.1:10808
+# or, using xray's HTTP inbound:
+sudo ./netlogger.py --mitm-upstream http://127.0.0.1:10809
+```
+
+`--mitm-upstream` accepts `http://`, `https://`, `socks5://` and `socks5h://`
+(with optional `user:pass@`). With SOCKS5 the host name is sent to the proxy, so
+DNS happens on the far side (good for split-tunnel/bypass rules). Point your
+browser or the system proxy at netlogger (`127.0.0.1:8080`) and you get full
+URLs while the VPN still carries the traffic.
+
+Two gotchas: (1) netlogger only changes the system proxy, not the environment
+already exported in your terminal — if `$HTTPS_PROXY` points at xray, either
+`unset HTTPS_PROXY HTTP_PROXY ALL_PROXY` or run your command through netlogger
+with `-- CMD`; (2) some VPN GUIs (v2rayN's "system proxy") re-apply their own
+proxy setting, so prefer pointing the browser at netlogger manually while you
+capture.
 
 ### Keeping the CA trusted
 
@@ -288,7 +320,8 @@ the transfer looks incomplete), peer address, notes.
 2. The proxy accepts the client's `CONNECT`, answers `200`, and terminates TLS
    with a certificate for the requested host (SNI is honoured too).
 3. The HTTP request is parsed and forwarded upstream over a fresh verified TLS
-   connection; `Expect: 100-continue`, chunked bodies, keep-alive, redirects, 1xx
+   connection (directly, or through `--mitm-upstream` for a VPN/local proxy);
+   `Expect: 100-continue`, chunked bodies, keep-alive, redirects, 1xx
    responses and WebSocket upgrades are handled. Verification can be disabled
    for local testing with `--mitm-insecure`.
 4. The response is relayed byte-for-byte and a normal `Record` is pushed into
@@ -321,7 +354,9 @@ the transfer looks incomplete), peer address, notes.
 
 - **Apps must use the proxy.** In the default mode netlogger sees what goes
   through its proxy: the GNOME system proxy, or the environment you set. Apps
-  that ignore both (or use QUIC) are missed — use `--capture` for those.
+  that ignore both (or use QUIC) are missed — use `--capture` for those. If your
+  traffic already goes through a local VPN proxy, netlogger sees none of it;
+  chain the two with `--mitm-upstream` (see above).
 - **HTTPS paths are encrypted in capture mode.** You get the host (SNI), the
   process, the byte count and the TLS version — not `/path/file.zip`. HTTP/2 and
   HTTP/3 paths are compressed (HPACK/QPACK) as well.
@@ -344,7 +379,7 @@ the transfer looks incomplete), peer address, notes.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 88 tests, no root needed
+python3 -m unittest discover -s tests -v   # 91 tests, no root needed
 ./netlogger.py --selftest                  # 26 built-in checks
 ```
 
@@ -353,9 +388,10 @@ TLS ClientHello split across segments, DNS, WebSocket, HTTP/2 preface) and push
 them through the exact same engine the live sniffer uses. The proxy tests start
 a real loopback HTTP/HTTPS origin, intercept it through the proxy, verify the
 full path/TLS record, and cover `CONNECT` tunnelling, keep-alive connection
-reuse, the openssl certificate backend, mode selection, the automatic
-trust/proxy behaviour (mocked, so your system is never touched) and a
-`gsettings` save/restore round-trip (with a fake `gsettings`).
+reuse, the openssl certificate backend, chaining through a fake HTTP and SOCKS5
+upstream proxy, mode selection, the automatic trust/proxy behaviour (mocked, so
+your system is never touched) and a `gsettings` save/restore round-trip (with a
+fake `gsettings`).
 
 ## Files
 

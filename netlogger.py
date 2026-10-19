@@ -12,6 +12,7 @@ so browsers and other apps are covered:
     ./netlogger.py -- curl https://example.com/file   # proxy just this one command
     ./netlogger.py --no-system-proxy    # proxy only, leave the desktop proxy alone
     sudo ./netlogger.py --no-ca-install # proxy without touching the trust stores
+    sudo ./netlogger.py --mitm-upstream socks5h://127.0.0.1:10808   # keep a VPN in the loop
 
 Want the old raw-packet view (every interface, DNS, QUIC, no proxy)?  Use
 --capture; it needs root or CAP_NET_RAW and sees traffic that never goes through
@@ -37,6 +38,7 @@ import argparse
 import ast
 import csv
 import errno
+import base64
 import fnmatch
 import glob
 import hashlib
@@ -60,7 +62,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 PROG = "netlogger"
 
 # --------------------------------------------------------------------------- #
@@ -2999,6 +3001,33 @@ def restore_system_proxy(ca_dir: str, color: Optional[Color] = None,
 #  the proxy itself
 # --------------------------------------------------------------------------- #
 
+def parse_upstream(url: str) -> Optional[Tuple[str, str, int, Optional[str], Optional[str]]]:
+    """Parse an upstream proxy URL into (scheme, host, port, user, password).
+
+    Accepts ``http://``, ``https://``, ``socks5://`` and ``socks5h://`` (the
+    latter two are treated the same: the host name is sent to the proxy, so DNS
+    happens on the far side).  Returns ``None`` for an empty URL.
+    """
+    text = (url or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = "http://" + text
+    parts = urllib.parse.urlsplit(text)
+    scheme = (parts.scheme or "http").lower()
+    if scheme in ("socks", "socks5", "socks5h"):
+        scheme = "socks5"
+    elif scheme not in ("http", "https"):
+        raise ValueError(f"unsupported proxy scheme: {parts.scheme}")
+    host = parts.hostname
+    if not host:
+        raise ValueError("proxy URL has no host")
+    port = parts.port or (1080 if scheme == "socks5" else 8080)
+    user = urllib.parse.unquote(parts.username) if parts.username else None
+    password = urllib.parse.unquote(parts.password) if parts.password else None
+    return scheme, host, int(port), user, password
+
+
 class MitmProxy:
     MAX_HEAD = 131072
     MAX_CONNS = 512
@@ -3020,6 +3049,7 @@ class MitmProxy:
         self._proc_lock = threading.Lock()
         self._client_cache: Dict[Tuple[str, int], Tuple[float, Optional[int], str]] = {}
         self._ignore = [p.lower() for p in (cfg.mitm_ignore or [])]
+        self._upstream = parse_upstream(getattr(cfg, "mitm_upstream", "") or "")
 
     # -- lifecycle --------------------------------------------------------- #
     def start(self) -> None:
@@ -3448,12 +3478,29 @@ class MitmProxy:
         return ctx.wrap_socket(conn, server_side=True)
 
     def _connect_upstream(self, host: str, port: int, tls: bool) -> Any:
-        raw = socket.create_connection((host, port), timeout=self.timeout)
-        raw.settimeout(self.timeout)
-        try:
-            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            pass
+        if self._upstream:
+            scheme, uhost, uport, _user, _pass = self._upstream
+            raw = socket.create_connection((uhost, uport), timeout=self.timeout)
+            try:
+                raw.settimeout(self.timeout)
+                try:
+                    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+                self._tunnel_upstream(raw, host, port)
+            except Exception:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+                raise
+        else:
+            raw = socket.create_connection((host, port), timeout=self.timeout)
+            raw.settimeout(self.timeout)
+            try:
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
         if not tls:
             return raw
         ctx = ssl.create_default_context()
@@ -3469,6 +3516,82 @@ class MitmProxy:
             except OSError:
                 pass
             raise
+
+    @staticmethod
+    def _recv_exact(sock: Any, want: int) -> bytes:
+        buf = b""
+        while len(buf) < want:
+            chunk = sock.recv(want - len(buf))
+            if not chunk:
+                raise OSError("upstream proxy closed the connection")
+            buf += chunk
+        return buf
+
+    def _tunnel_upstream(self, sock: Any, host: str, port: int) -> None:
+        """Ask the configured upstream proxy to open a TCP tunnel to host:port."""
+        scheme, _uhost, _uport, user, password = self._upstream
+        if scheme == "http":
+            lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+            if user is not None:
+                token = base64.b64encode(
+                    f"{user}:{password or ''}".encode("utf-8")).decode("ascii")
+                lines.append(f"Proxy-Authorization: Basic {token}")
+            lines.append("Proxy-Connection: keep-alive")
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin1"))
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise OSError("upstream proxy closed the connection")
+                head += chunk
+                if len(head) > 65536:
+                    raise OSError("upstream proxy sent an oversized response")
+            status = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            bits = status.split()
+            if len(bits) < 2 or not bits[1].startswith("2"):
+                raise OSError(f"upstream proxy refused: {status.strip()}")
+            return
+
+        # SOCKS5 (hostname passed through, so DNS happens at the proxy)
+        methods = b"\x00\x02" if user is not None else b"\x00"
+        sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        reply = self._recv_exact(sock, 2)
+        if reply[0] != 0x05:
+            raise OSError("bad SOCKS version from upstream proxy")
+        if reply[1] == 0x02:
+            ub = (user or "").encode("utf-8")
+            pb = (password or "").encode("utf-8")
+            sock.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
+            auth = self._recv_exact(sock, 2)
+            if auth[1] != 0x00:
+                raise OSError("SOCKS authentication failed")
+        elif reply[1] != 0x00:
+            raise OSError("upstream proxy offered no supported SOCKS auth method")
+        try:
+            packed = socket.inet_pton(socket.AF_INET, host)
+            req = b"\x05\x01\x00\x01" + packed
+        except OSError:
+            try:
+                packed = socket.inet_pton(socket.AF_INET6, host)
+                req = b"\x05\x01\x00\x04" + packed
+            except OSError:
+                hb = host.encode("idna")
+                req = b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb
+        req += struct.pack(">H", port)
+        sock.sendall(req)
+        head = self._recv_exact(sock, 4)
+        if head[1] != 0x00:
+            raise OSError(f"SOCKS connect failed (code {head[1]})")
+        atyp = head[3]
+        if atyp == 0x01:
+            self._recv_exact(sock, 4)
+        elif atyp == 0x04:
+            self._recv_exact(sock, 16)
+        elif atyp == 0x03:
+            self._recv_exact(sock, self._recv_exact(sock, 1)[0])
+        else:
+            raise OSError("bad SOCKS reply from upstream proxy")
+        self._recv_exact(sock, 2)
 
     def _ignored(self, host: str) -> bool:
         if not self._ignore:
@@ -3793,6 +3916,8 @@ def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> in
     if not cfg.quiet:
         emitter.banner(f"MITM proxy on {env['https_proxy']} · CA {ca.cert_path}")
         emitter.banner("TLS is terminated locally · full paths are logged")
+        if cfg.mitm_upstream:
+            emitter.banner(f"upstream: every request is forwarded via {cfg.mitm_upstream}")
         if auto_ca and ca_installed_here:
             emitter.banner("CA trusted system-wide — removed again when netlogger exits")
         emitter.banner("this shell:  export " +
@@ -4174,6 +4299,7 @@ examples:
   netlogger.py -- curl https://x/y           proxy just this one command
   sudo netlogger.py --no-ca-install          proxy without touching the trust stores
   sudo netlogger.py --no-system-proxy        proxy only, leave GNOME's proxy alone
+  sudo netlogger.py --mitm-upstream socks5h://127.0.0.1:10808   keep your VPN in the loop
   netlogger.py --mitm-ca-show                show the CA path + fingerprint
 
   sudo netlogger.py --capture                raw packet capture (the old default)
@@ -4202,6 +4328,10 @@ modes:
   --capture: the raw AF_PACKET sniffer (needs root or CAP_NET_RAW). Without a
   proxy, HTTPS paths cannot be seen — TLS hides them — but you get every
   interface, DNS and QUIC traffic that never goes through the proxy.
+
+  --mitm-upstream URL: forward every upstream connection through another proxy
+  (http://, https://, socks5:// or socks5h://), so netlogger can sit in front of
+  xray/v2ray/clash/sing-box and you still get full URLs and keep the VPN.
 
 notes:
   · traffic numbers count application payload (what the app sent/received),
@@ -4280,6 +4410,10 @@ notes:
                    help="proxy port (default 8080; 0 = pick a free one)")
     g.add_argument("--mitm-listen", default="127.0.0.1", metavar="ADDR",
                    help="proxy listen address (default 127.0.0.1)")
+    g.add_argument("--mitm-upstream", metavar="URL", default="",
+                   help="forward every upstream connection through another proxy, "
+                        "e.g. socks5://127.0.0.1:10808 or http://127.0.0.1:10809 "
+                        "(keeps your VPN in the loop while netlogger sees full URLs)")
     g.add_argument("--mitm-system", action="store_true", default=None,
                    help="point GNOME's system proxy at it (default: on when no command is given)")
     g.add_argument("--no-system-proxy", action="store_true",
@@ -4544,11 +4678,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if capture_mode:
         if args.command:
             parser.error("a command can only be run with the MITM proxy (drop --capture)")
+        if args.mitm_upstream:
+            parser.error("--mitm-upstream only works with the MITM proxy (drop --capture)")
     else:
         if not (0 <= args.mitm_port <= 65535):
             parser.error("--mitm-port must be between 0 and 65535")
         if args.mitm_timeout <= 0:
             parser.error("--mitm-timeout must be > 0")
+        try:
+            parse_upstream(args.mitm_upstream)
+        except ValueError as exc:
+            parser.error(f"--mitm-upstream: {exc}")
 
     # a few sanity checks that would otherwise fail confusingly mid-capture
     try:

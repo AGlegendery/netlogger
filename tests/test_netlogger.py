@@ -855,6 +855,109 @@ def _mitm_cfg(*extra: str):
         ["--mitm", "--mitm-port", "0", "-q", "--mitm-insecure", *extra])
 
 
+class _FakeUpstream:
+    """A tiny CONNECT/SOCKS5 proxy used to prove --mitm-upstream works."""
+
+    def __init__(self, mode: str = "http"):
+        self.mode = mode
+        self.targets = []
+        self._stop = False
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    @staticmethod
+    def _recv_exact(sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        return buf
+
+    def _handle(self, conn):
+        up = None
+        try:
+            if self.mode == "http":
+                head = b""
+                while b"\r\n\r\n" not in head:
+                    chunk = conn.recv(1)
+                    if not chunk:
+                        return
+                    head += chunk
+                method, target, _ = head.split(b"\r\n", 1)[0].decode().split()
+                if method != "CONNECT":
+                    return
+                host, _, port = target.rpartition(":")
+                up = socket.create_connection((host, int(port)), timeout=5)
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            else:
+                greet = self._recv_exact(conn, 2)
+                self._recv_exact(conn, greet[1])
+                conn.sendall(b"\x05\x00")
+                req = self._recv_exact(conn, 4)
+                if req[3] == 0x01:
+                    host = socket.inet_ntoa(self._recv_exact(conn, 4))
+                elif req[3] == 0x03:
+                    host = self._recv_exact(conn, self._recv_exact(conn, 1)[0]).decode()
+                else:
+                    host = socket.inet_ntop(socket.AF_INET6, self._recv_exact(conn, 16))
+                port = struct.unpack(">H", self._recv_exact(conn, 2))[0]
+                up = socket.create_connection((host, port), timeout=5)
+                conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
+            self.targets.append((host, int(port)))
+            self._relay(conn, up)
+        except OSError:
+            pass
+        finally:
+            for sock in (conn, up):
+                try:
+                    sock.close()
+                except (OSError, AttributeError):
+                    pass
+
+    @staticmethod
+    def _relay(a, b):
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=pump, args=(a, b), daemon=True)
+        t.start()
+        pump(b, a)
+        t.join(timeout=5)
+
+    def stop(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class TestMitmHelpers(unittest.TestCase):
     def test_split_host_port(self):
         self.assertEqual(nl.split_host_port("example.com"), ("example.com", 443))
@@ -1141,6 +1244,82 @@ class TestMitmProxy(unittest.TestCase):
             finally:
                 proxy.stop()
                 echo.close()
+
+
+    def test_parse_upstream(self):
+        self.assertIsNone(nl.parse_upstream(""))
+        self.assertEqual(nl.parse_upstream("127.0.0.1:10809"),
+                         ("http", "127.0.0.1", 10809, None, None))
+        self.assertEqual(nl.parse_upstream("http://u:p@127.0.0.1:1080"),
+                         ("http", "127.0.0.1", 1080, "u", "p"))
+        self.assertEqual(nl.parse_upstream("socks5h://127.0.0.1:10808"),
+                         ("socks5", "127.0.0.1", 10808, None, None))
+        self.assertEqual(nl.parse_upstream("socks://127.0.0.1"),
+                         ("socks5", "127.0.0.1", 1080, None, None))
+        with self.assertRaises(ValueError):
+            nl.parse_upstream("ftp://example.com:21")
+
+
+class TestMitmUpstream(unittest.TestCase):
+    def test_http_upstream_proxy(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            origin = _start_origin()
+            up = _FakeUpstream("http")
+            cfg = _mitm_cfg("--mitm-upstream", f"http://127.0.0.1:{up.port}")
+            proxy = nl.MitmProxy(cfg, ca, queue.Queue(), nl.ProcMap())
+            proxy.start()
+            try:
+                port = origin.server_address[1]
+                s = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                s.sendall((f"GET http://127.0.0.1:{port}/via/upstream.zip HTTP/1.1\r\n"
+                           f"Host: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").encode())
+                data = _read_all(s)
+                s.close()
+                self.assertIn(_MitmOrigin.body, data)
+                rec = _wait_record(proxy.out)
+                self.assertEqual(rec.path, "/via/upstream.zip")
+                self.assertEqual(up.targets, [("127.0.0.1", port)])
+            finally:
+                proxy.stop()
+                _stop_origin(origin)
+                up.stop()
+
+    def test_socks5_upstream_https(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            cert, key = ca.leaf_paths("127.0.0.1")
+            sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            sctx.load_cert_chain(cert, key)
+            origin = _start_origin(sctx)
+            up = _FakeUpstream("socks5")
+            cfg = _mitm_cfg("--mitm-upstream", f"socks5://127.0.0.1:{up.port}")
+            proxy = nl.MitmProxy(cfg, ca, queue.Queue(), nl.ProcMap())
+            proxy.start()
+            try:
+                port = origin.server_address[1]
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                raw.sendall((f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+                             f"Host: 127.0.0.1:{port}\r\n\r\n").encode())
+                self.assertIn(b"200", _read_head(raw).split(b"\r\n")[0])
+                cctx = ssl.create_default_context(cafile=ca.cert_path)
+                tls = cctx.wrap_socket(raw, server_hostname="127.0.0.1")
+                tls.sendall(b"GET /files/linux.iso?mirror=eu HTTP/1.1\r\n"
+                            b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                data = _read_all(tls)
+                tls.close()
+                self.assertIn(_MitmOrigin.body, data)
+                rec = _wait_record(proxy.out)
+                self.assertEqual(rec.scheme, "https")
+                self.assertEqual(rec.path, "/files/linux.iso")
+                self.assertEqual(rec.query, "mirror=eu")
+                self.assertEqual(up.targets, [("127.0.0.1", port)])
+            finally:
+                proxy.stop()
+                _stop_origin(origin)
+                up.stop()
 
 
 class TestModeSelection(unittest.TestCase):
