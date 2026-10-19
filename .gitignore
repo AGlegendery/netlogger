@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# netlogger output
+*.pcap
+dump.pcap
+fetches.jsonl
+fetches.csv
+*.log
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+*.swp
