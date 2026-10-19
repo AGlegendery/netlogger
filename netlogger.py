@@ -3,16 +3,16 @@
 """
 netlogger — watch every fetch your apps make, live, in colour.
 
-A small, dependency-free Linux network logger.  It sniffs packets with a raw
-AF_PACKET socket, reassembles just enough TCP/UDP state, attributes every
-connection to the process that owns it (via /proc), recognises the application
-protocol (HTTP / WebSocket / TLS(SNI) / HTTP-2 / QUIC / DNS) and prints one
-colourful line per fetch:
+A small Linux network logger.  It sniffs packets with a raw AF_PACKET socket,
+reassembles just enough TCP/UDP state, attributes every connection to the
+process that owns it (via /proc), recognises the application protocol
+(HTTP / WebSocket / TLS(SNI) / HTTP-2 / QUIC / DNS) and prints one colourful
+line per fetch:
 
     12:33:04 [GET  ] download.example.com/package1.zip - 12.6 MB  ↓12.6 MB ↑1.2 KB · 0.41s · 3.9 MB/s · curl(2381)
 
-No third party modules, no eBPF, no libpcap — just the Python standard library
-and /proc.  Run it as root (or with CAP_NET_RAW) because raw sockets need it:
+Packet capture uses only the Python standard library, /proc, and no eBPF or
+libpcap.  Run it as root (or with CAP_NET_RAW) because raw sockets need it:
 
     sudo ./netlogger.py                 # everything on every real interface
     sudo ./netlogger.py -i wlan0        # one interface only
@@ -21,30 +21,53 @@ and /proc.  Run it as root (or with CAP_NET_RAW) because raw sockets need it:
     ./netlogger.py --demo               # pretty demo, no root needed
     ./netlogger.py --selftest           # parser self checks, no root needed
 
+TLS hides paths.  For full HTTPS URLs, run the built-in MITM proxy (no root,
+no mitmproxy install; it uses cryptography or the openssl CLI to make a local
+CA and per-host certificates):
+
+    ./netlogger.py --mitm               # proxy on 127.0.0.1:8080
+    ./netlogger.py --mitm -- curl https://example.com/file   # just this app
+    ./netlogger.py --mitm --mitm-system # point GNOME's system proxy at it
+    ./netlogger.py --mitm-ca-install    # trust the CA system-wide + browsers
+    ./netlogger.py --mitm-restore       # undo --mitm-system after a hard kill
+
+Apps with certificate pinning will refuse the MITM certificate; pass those
+hosts through untouched with --mitm-ignore.  The CA private key lives in
+~/.config/netlogger/mitm and is sensitive.
+
 Author: built for you.  License: MIT.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import errno
 import fnmatch
+import glob
+import hashlib
 import json
 import os
+import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
+import ssl
 import struct
+import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 PROG = "netlogger"
 
 # --------------------------------------------------------------------------- #
@@ -865,6 +888,14 @@ class ProcMap:
             return None
         return self._inode_proc.get(ino)
 
+    def lookup_fresh(self, proto: str, ip: str, port: int) -> Optional[Tuple[int, str]]:
+        """Like lookup(), but re-reads /proc immediately (MITM connections)."""
+        if not self.available:
+            return None
+        self._last = 0.0
+        self.refresh(force=True)
+        return self.lookup(proto, ip, port)
+
     # -- internals --------------------------------------------------------- #
     def _read_proc_net(self) -> Dict[Tuple[str, str, int], int]:
         out: Dict[Tuple[str, str, int], int] = {}
@@ -1073,8 +1104,9 @@ class Record:
     def url(self) -> str:
         host = self.host or self.server_ip or "-"
         if self.show_port and self.server_port:
-            sep = ":" if ":" not in host or host.startswith("[") else ":"
-            host = f"{host}{sep}{self.server_port}"
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            host = f"{host}:{self.server_port}"
         scheme = self.scheme or ("https" if self.app in ("HTTPS", "H2", "H3") else "http")
         if not self.path or self.path == "-":
             if scheme in ("http", "https", "ws", "wss", "quic"):
@@ -2026,6 +2058,1755 @@ class Sniffer:
 #  demo + selftest
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+#  MITM proxy — full URLs for TLS, no mitmproxy needed
+# --------------------------------------------------------------------------- #
+
+MITM_CA_DIRNAME = "mitm"
+MITM_CA_NAME = "netlogger MITM CA"
+_PROXY_HOP = {"proxy-connection", "proxy-authorization", "proxy-authenticate"}
+
+
+class _ProtocolError(Exception):
+    pass
+
+
+def _target_home() -> str:
+    """Home of the human who invoked us (not /root when using sudo)."""
+    user = os.environ.get("SUDO_USER") or ""
+    if os.geteuid() == 0 and user and user != "root":
+        try:
+            import pwd
+            return pwd.getpwnam(user).pw_dir
+        except (KeyError, ImportError):
+            pass
+    return os.path.expanduser("~")
+
+
+def _target_uid_gid() -> Optional[Tuple[int, int, str]]:
+    user = os.environ.get("SUDO_USER") or ""
+    if os.geteuid() != 0 or not user or user == "root":
+        return None
+    try:
+        import pwd
+        pw = pwd.getpwnam(user)
+        return pw.pw_uid, pw.pw_gid, pw.pw_dir
+    except (KeyError, ImportError):
+        return None
+
+
+def mitm_default_dir() -> str:
+    if os.geteuid() == 0 and _target_uid_gid() is not None:
+        base = os.path.join(_target_home(), ".config")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "netlogger", MITM_CA_DIRNAME)
+
+
+def split_host_port(authority: str, default_port: int = 443) -> Tuple[str, int]:
+    """'example.com:8443', '[::1]:443' or 'example.com' -> (host, port)."""
+    authority = (authority or "").strip()
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 0:
+            return authority, default_port
+        host = authority[1:end]
+        rest = authority[end + 1:]
+        if rest.startswith(":"):
+            try:
+                return host, int(rest[1:])
+            except ValueError:
+                return host, default_port
+        return host, default_port
+    if authority.count(":") == 1:
+        host, maybe_port = authority.rsplit(":", 1)
+        try:
+            return host, int(maybe_port)
+        except ValueError:
+            return host, default_port
+    return authority, default_port
+
+
+def absolute_target(target: str) -> Tuple[str, str, str, int]:
+    """http://host:port/path?q -> (scheme, host, path?q, port)."""
+    try:
+        sp = urllib.parse.urlsplit(target)
+    except ValueError:
+        return "http", "", target, 80
+    scheme = (sp.scheme or "http").lower()
+    host = sp.hostname or ""
+    try:
+        port = sp.port or (443 if scheme in ("https", "wss") else 80)
+    except ValueError:
+        port = 443 if scheme in ("https", "wss") else 80
+    path = sp.path or "/"
+    if sp.query:
+        path += "?" + sp.query
+    return scheme, host, path, port
+
+
+def _split_head(head: bytes) -> Tuple[str, List[Tuple[str, str]]]:
+    text = head.split(b"\r\n\r\n", 1)[0]
+    lines = re.split(rb"\r?\n", text)
+    if not lines:
+        raise _ProtocolError("empty head")
+    try:
+        first = lines[0].decode("latin-1")
+        hdrs: List[Tuple[str, str]] = []
+        for raw in lines[1:]:
+            if not raw or b":" not in raw:
+                continue
+            k, v = raw.split(b":", 1)
+            hdrs.append((k.decode("latin-1").strip(), v.decode("latin-1").strip()))
+        return first, hdrs
+    except UnicodeDecodeError as exc:
+        raise _ProtocolError("bad header encoding") from exc
+
+
+def parse_request_head(head: bytes) -> Tuple[str, str, str, List[Tuple[str, str]]]:
+    first, hdrs = _split_head(head)
+    parts = first.split(" ")
+    if len(parts) < 2:
+        raise _ProtocolError("bad request line")
+    method = parts[0].upper()
+    target = parts[1]
+    version = parts[2] if len(parts) > 2 else "HTTP/1.0"
+    if not method or not target:
+        raise _ProtocolError("bad request line")
+    return method, target, version, hdrs
+
+
+def parse_response_head(head: bytes) -> Tuple[int, str, List[Tuple[str, str]]]:
+    first, hdrs = _split_head(head)
+    parts = first.split(" ", 2)
+    if len(parts) < 2 or not parts[0].upper().startswith("HTTP/"):
+        raise _ProtocolError("bad status line")
+    try:
+        status = int(parts[1])
+    except ValueError as exc:
+        raise _ProtocolError("bad status code") from exc
+    return status, (parts[2] if len(parts) > 2 else ""), hdrs
+
+
+def header_dict(hdrs: Sequence[Tuple[str, str]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in hdrs:
+        out[k.lower()] = v
+    return out
+
+
+def sanitise_headers(hdrs: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Keep the first Host/Content-Length/Transfer-Encoding, drop duplicates."""
+    once = {"host", "content-length", "transfer-encoding"}
+    seen = set()
+    out: List[Tuple[str, str]] = []
+    for k, v in hdrs:
+        kl = k.lower()
+        if kl in once:
+            if kl in seen:
+                continue
+            seen.add(kl)
+        out.append((k, v))
+    return out
+
+
+def build_head(first_line: str, hdrs: Sequence[Tuple[str, str]], *,
+               host: str = "", default_port: int = 0, drop: Sequence[str] = ()) -> bytes:
+    drop_l = {d.lower() for d in drop} | _PROXY_HOP
+    out = [first_line]
+    have_host = False
+    for k, v in hdrs:
+        kl = k.lower()
+        if kl in drop_l:
+            continue
+        if kl == "host":
+            have_host = True
+        out.append(f"{k}: {v}")
+    if not have_host and host:
+        h = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        if default_port:
+            h += f":{default_port}"
+        out.append(f"Host: {h}")
+    return ("\r\n".join(out) + "\r\n\r\n").encode("latin-1", "replace")
+
+
+def _origin_form(target: str) -> str:
+    """Split proxy request target into (origin path, query)."""
+    if target.startswith(("http://", "https://")):
+        _scheme, _host, path, _port = absolute_target(target)
+        return path
+    return target or "/"
+
+
+def _split_path_query(path: str) -> Tuple[str, str]:
+    p, _, q = (path or "/").partition("?")
+    return (p or "/"), q
+
+
+class _Reader:
+    """Buffered reader over a blocking socket (plain or TLS)."""
+
+    def __init__(self, sock: Any, initial: bytes = b"") -> None:
+        self.sock = sock
+        self.buf = bytearray(initial)
+
+    def _fill(self, n: int = 65536) -> bool:
+        data = self.sock.recv(n)
+        if not data:
+            return False
+        self.buf += data
+        return True
+
+    def read_until(self, delim: bytes, limit: int = 131072) -> bytes:
+        while True:
+            idx = self.buf.find(delim)
+            if idx >= 0:
+                end = idx + len(delim)
+                out = bytes(self.buf[:end])
+                del self.buf[:end]
+                return out
+            if len(self.buf) > limit:
+                raise _ProtocolError("header too large")
+            if not self._fill():
+                out = bytes(self.buf)
+                self.buf.clear()
+                return out
+
+    def read_exact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            if not self._fill(max(65536, n - len(self.buf))):
+                raise EOFError("unexpected eof")
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def read_some(self, n: int = 65536) -> bytes:
+        if self.buf:
+            out = bytes(self.buf[:n])
+            del self.buf[:n]
+            return out
+        return self.sock.recv(n)
+
+
+def _relay_exact(reader: _Reader, writer: Any, n: int) -> int:
+    left = n
+    done = 0
+    while left > 0:
+        chunk = reader.read_some(min(left, 65536))
+        if not chunk:
+            raise EOFError("short body")
+        writer.sendall(chunk)
+        left -= len(chunk)
+        done += len(chunk)
+    return done
+
+
+def _relay_chunked(reader: _Reader, writer: Any) -> int:
+    total = 0
+    while True:
+        line = reader.read_until(b"\r\n", 16384)
+        if not line.endswith(b"\r\n"):
+            raise EOFError("short chunk")
+        writer.sendall(line)
+        total += len(line)
+        try:
+            size = int(line.split(b";", 1)[0].strip(), 16)
+        except ValueError as exc:
+            raise _ProtocolError("bad chunk size") from exc
+        if size == 0:
+            while True:
+                trailer = reader.read_until(b"\r\n", 16384)
+                if not trailer.endswith(b"\r\n"):
+                    raise EOFError("short trailer")
+                writer.sendall(trailer)
+                total += len(trailer)
+                if trailer == b"\r\n":
+                    return total
+        data = reader.read_exact(size + 2)
+        writer.sendall(data)
+        total += len(data)
+
+
+def _relay_to_eof(reader: _Reader, writer: Any) -> int:
+    total = 0
+    while True:
+        chunk = reader.read_some(65536)
+        if not chunk:
+            return total
+        writer.sendall(chunk)
+        total += len(chunk)
+
+
+class CertAuthority:
+    """Local CA + on-demand per-host leaf certificates.
+
+    Uses ``cryptography`` when present and falls back to the openssl CLI, so
+    MITM mode adds no mandatory Python dependency.
+    """
+
+    def __init__(self, directory: str) -> None:
+        self.dir = os.path.abspath(os.path.expanduser(directory))
+        self.cert_path = os.path.join(self.dir, "ca.pem")
+        self.key_path = os.path.join(self.dir, "ca-key.pem")
+        self.certs_dir = os.path.join(self.dir, "certs")
+        self._backend_name: Optional[str] = None
+        self._lock = threading.Lock()
+        self._contexts: Dict[str, ssl.SSLContext] = {}
+        self._paths: Dict[str, Tuple[str, str]] = {}
+
+    # -- setup ------------------------------------------------------------- #
+    def backend(self) -> str:
+        if self._backend_name:
+            return self._backend_name
+        try:
+            import cryptography  # noqa: F401
+            self._backend_name = "cryptography"
+        except ImportError:
+            if shutil.which("openssl"):
+                self._backend_name = "openssl"
+            else:
+                raise RuntimeError(
+                    "MITM needs the python 'cryptography' module or the openssl CLI.\n"
+                    "  Arch:   sudo pacman -S python-cryptography openssl\n"
+                    "  Debian: sudo apt install python3-cryptography openssl"
+                )
+        return self._backend_name
+
+    def exists(self) -> bool:
+        return os.path.isfile(self.cert_path) and os.path.isfile(self.key_path)
+
+    def ensure(self) -> None:
+        if self.exists():
+            for path in (self.cert_path, self.key_path):
+                try:
+                    with open(path, "rb") as fh:
+                        fh.read(1)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"CA in {self.dir} is not readable ({exc}).\n"
+                        f"  run with the same user that created it, as root, or use --mitm-ca-dir"
+                    ) from exc
+            self._fix_perms()
+            return
+        with self._lock:
+            if self.exists():
+                return
+            if os.path.exists(self.cert_path) or os.path.exists(self.key_path):
+                raise RuntimeError(
+                    f"incomplete CA in {self.dir} (cert or key missing).\n"
+                    f"  remove {self.dir} and run again, or use --mitm-ca-reset"
+                )
+            os.makedirs(self.dir, exist_ok=True)
+            os.makedirs(self.certs_dir, exist_ok=True)
+            try:
+                self._generate_ca()
+            except Exception:
+                for p in (self.cert_path, self.key_path):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+                raise
+            self._fix_perms()
+
+    def _fix_perms(self) -> None:
+        try:
+            os.chmod(self.dir, 0o711)
+        except OSError:
+            pass
+        try:
+            os.chmod(self.cert_path, 0o644)
+            os.chmod(self.key_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.chmod(self.certs_dir, 0o700)
+        except OSError:
+            pass
+        info = _target_uid_gid()
+        if info is not None:
+            uid, gid, _home = info
+            for path in (self.dir, self.cert_path, self.key_path, self.certs_dir):
+                try:
+                    os.chown(path, uid, gid)
+                except OSError:
+                    pass
+
+    def reset(self) -> None:
+        for path in (self.cert_path, self.key_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        shutil.rmtree(self.certs_dir, ignore_errors=True)
+        self._contexts.clear()
+        self._paths.clear()
+
+    # -- CA generation ----------------------------------------------------- #
+    def _generate_ca(self) -> None:
+        if self.backend() == "cryptography":
+            self._ca_cryptography()
+        else:
+            self._ca_openssl()
+
+    def _ca_cryptography(self) -> None:
+        import datetime
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+        name = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, MITM_CA_NAME),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "netlogger"),
+        ])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=False, content_commitment=False,
+                    key_encipherment=False, data_encipherment=False,
+                    key_agreement=False, key_cert_sign=True, crl_sign=True,
+                    encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256())
+        )
+        key_pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+        self._write_private(self.key_path, key_pem)
+        with open(self.cert_path, "wb") as fh:
+            fh.write(cert_pem)
+
+    def _ca_openssl(self) -> None:
+        cmd = [
+            "openssl", "req", "-x509", "-newkey", "rsa:3072", "-nodes",
+            "-keyout", self.key_path, "-out", self.cert_path, "-days", "3650",
+            "-subj", f"/CN={MITM_CA_NAME}/O=netlogger",
+            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        ]
+        old_umask = os.umask(0o077)
+        try:
+            self._run_openssl(cmd)
+        finally:
+            os.umask(old_umask)
+        os.chmod(self.key_path, 0o600)
+
+    # -- leaf certificates ------------------------------------------------- #
+    def _safe_name(self, host: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", host)[:80] or "host"
+        digest = hashlib.sha256(host.encode("utf-8", "replace")).hexdigest()[:8]
+        return f"{safe}-{digest}"
+
+    def leaf_paths(self, host: str) -> Tuple[str, str]:
+        host = self._normalise_host(host)
+        with self._lock:
+            hit = self._paths.get(host)
+            if hit and os.path.isfile(hit[0]) and os.path.isfile(hit[1]):
+                return hit
+        os.makedirs(self.certs_dir, exist_ok=True)
+        base = os.path.join(self.certs_dir, self._safe_name(host))
+        cert_path, key_path = base + ".pem", base + "-key.pem"
+        with self._lock:
+            hit = self._paths.get(host)
+            if hit and os.path.isfile(hit[0]) and os.path.isfile(hit[1]):
+                return hit
+            if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+                if self.backend() == "cryptography":
+                    self._leaf_cryptography(host, cert_path, key_path)
+                else:
+                    self._leaf_openssl(host, cert_path, key_path)
+                info = _target_uid_gid()
+                if info is not None:
+                    for p in (cert_path, key_path, self.certs_dir):
+                        try:
+                            os.chown(p, info[0], info[1])
+                        except OSError:
+                            pass
+            self._paths[host] = (cert_path, key_path)
+            return cert_path, key_path
+
+    @staticmethod
+    def _normalise_host(host: str) -> str:
+        host = (host or "").strip().strip("[]")
+        if not host:
+            return "localhost"
+        try:
+            if not host.isascii():
+                return host.encode("idna").decode("ascii")
+        except UnicodeError:
+            pass
+        return host
+
+    def _leaf_cryptography(self, host: str, cert_path: str, key_path: str) -> None:
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+        with open(self.cert_path, "rb") as fh:
+            ca_cert = x509.load_pem_x509_certificate(fh.read())
+        with open(self.key_path, "rb") as fh:
+            ca_key = serialization.load_pem_private_key(fh.read(), password=None)
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            san: Any = x509.IPAddress(ipaddress.ip_address(host))
+        except ValueError:
+            san = x509.DNSName(host)
+        cn = host if len(host) <= 64 else host[:64]
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=825))
+            .add_extension(x509.SubjectAlternativeName([san]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=False,
+                    key_encipherment=True, data_encipherment=False,
+                    key_agreement=False, key_cert_sign=False, crl_sign=False,
+                    encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                           critical=False)
+            .sign(ca_key, hashes.SHA256())
+        )
+        key_pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        self._write_private(key_path, key_pem)
+        with open(cert_path, "wb") as fh:
+            fh.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    def _leaf_openssl(self, host: str, cert_path: str, key_path: str) -> None:
+        import ipaddress
+        base = cert_path[:-4]
+        cnf = base + ".cnf"
+        csr = base + ".csr"
+        old_umask = os.umask(0o077)
+        try:
+            is_ip = False
+            try:
+                ipaddress.ip_address(host)
+                is_ip = True
+            except ValueError:
+                pass
+            san_line = f"IP.1 = {host}" if is_ip else f"DNS.1 = {host}"
+            with open(cnf, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "[req]\ndistinguished_name=dn\nprompt=no\n"
+                    f"[dn]\nCN={host[:64]}\n"
+                    "[ext]\nbasicConstraints=critical,CA:FALSE\n"
+                    "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                    "extendedKeyUsage=serverAuth\n"
+                    f"subjectAltName=@alt\n[alt]\n{san_line}\n"
+                )
+            self._run_openssl([
+                "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", key_path, "-out", csr, "-config", cnf,
+            ])
+            self._run_openssl([
+                "openssl", "x509", "-req", "-in", csr,
+                "-CA", self.cert_path, "-CAkey", self.key_path, "-CAcreateserial",
+                "-days", "825", "-sha256", "-extfile", cnf, "-extensions", "ext",
+                "-out", cert_path,
+            ])
+            os.chmod(key_path, 0o600)
+        finally:
+            for path in (cnf, csr):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            os.umask(old_umask)
+
+    @staticmethod
+    def _write_private(path: str, data: bytes) -> None:
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _run_openssl(cmd: Sequence[str]) -> None:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"openssl failed: {exc}") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise RuntimeError("openssl failed: " + (detail[-1] if detail else "unknown error"))
+
+    # -- TLS contexts ------------------------------------------------------ #
+    def leaf_context(self, host: str) -> ssl.SSLContext:
+        host = self._normalise_host(host)
+        with self._lock:
+            ctx = self._contexts.get(host)
+            if ctx is not None:
+                return ctx
+        cert_path, key_path = self.leaf_paths(host)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        except (AttributeError, ValueError):
+            pass
+        ctx.load_cert_chain(cert_path, key_path)
+        ctx.set_alpn_protocols(["http/1.1"])
+        with self._lock:
+            if len(self._contexts) > 1000:
+                self._contexts.clear()
+            self._contexts[host] = ctx
+        return ctx
+
+    def fingerprint(self) -> str:
+        try:
+            if self.backend() == "cryptography":
+                from cryptography import x509
+                from cryptography.hazmat.primitives import hashes
+                with open(self.cert_path, "rb") as fh:
+                    cert = x509.load_pem_x509_certificate(fh.read())
+                digest = cert.fingerprint(hashes.SHA256()).hex()
+            else:
+                proc = subprocess.run(
+                    ["openssl", "x509", "-in", self.cert_path, "-noout",
+                     "-fingerprint", "-sha256"],
+                    capture_output=True, text=True, timeout=20,
+                )
+                digest = (proc.stdout or "").split("=", 1)[-1].strip().replace(":", "")
+            return ":".join(digest[i:i + 2].upper() for i in range(0, len(digest), 2))
+        except Exception:
+            return ""
+
+
+# --------------------------------------------------------------------------- #
+#  CA trust installation
+# --------------------------------------------------------------------------- #
+
+def _sudo_prefix() -> List[str]:
+    if os.geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    return [sudo] if sudo else []
+
+
+def _run_cmd(cmd: Sequence[str], *, capture: bool = False, timeout: float = 120) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            list(cmd), text=True, timeout=timeout,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+        )
+        return proc.returncode, (proc.stdout or "") if capture else ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, str(exc)
+
+
+def system_anchor() -> Tuple[Optional[str], Optional[List[str]]]:
+    if os.path.isdir("/etc/ca-certificates/trust-source/anchors") and shutil.which("update-ca-trust"):
+        return "/etc/ca-certificates/trust-source/anchors/netlogger.crt", ["update-ca-trust"]
+    if os.path.isdir("/usr/local/share/ca-certificates") and shutil.which("update-ca-certificates"):
+        return "/usr/local/share/ca-certificates/netlogger.crt", ["update-ca-certificates"]
+    if os.path.isdir("/etc/pki/ca-trust/source/anchors") and shutil.which("update-ca-trust"):
+        return "/etc/pki/ca-trust/source/anchors/netlogger.crt", ["update-ca-trust"]
+    return None, None
+
+
+def nss_dirs() -> List[str]:
+    home = _target_home()
+    found: List[str] = []
+    for path in (os.path.join(home, ".pki", "nssdb"),):
+        if os.path.isdir(path):
+            found.append(path)
+    patterns = [
+        os.path.join(home, ".mozilla", "firefox", "*"),
+        os.path.join(home, ".var", "app", "org.mozilla.firefox", ".mozilla", "firefox", "*"),
+        os.path.join(home, "snap", "firefox", "common", ".mozilla", "firefox", "*"),
+    ]
+    for pattern in patterns:
+        for profile in glob.glob(pattern):
+            if os.path.isfile(os.path.join(profile, "cert9.db")):
+                found.append(profile)
+    seen = set()
+    out = []
+    for d in found:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _session_prefix() -> List[str]:
+    """Prefix to run a desktop command as the invoking user (for gsettings/NSS)."""
+    user = os.environ.get("SUDO_USER") or ""
+    if os.geteuid() != 0 or not user or user == "root":
+        return []
+    try:
+        import pwd
+        pw = pwd.getpwnam(user)
+    except (KeyError, ImportError):
+        return []
+    runtime = f"/run/user/{pw.pw_uid}"
+    env = [f"HOME={pw.pw_dir}", f"USER={user}", f"LOGNAME={user}"]
+    if os.path.isdir(runtime):
+        env += [f"XDG_RUNTIME_DIR={runtime}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"]
+    if shutil.which("runuser"):
+        return ["runuser", "-u", user, "--", "env"] + env
+    if shutil.which("sudo"):
+        return ["sudo", "-u", user, "--", "env"] + env
+    return []
+
+
+def install_ca(ca: CertAuthority, color: Color, remove: bool = False,
+               stream: Optional[Any] = None) -> int:
+    sink = stream or sys.stdout
+    rc = 0
+    anchor, update = system_anchor()
+    prefix = _sudo_prefix()
+    action = "remove" if remove else "install"
+    if not anchor:
+        sys.stderr.write(f"[{PROG}] no known system CA directory; skipping system trust\n")
+        rc = 2
+    else:
+        if remove:
+            code, _ = _run_cmd(prefix + ["rm", "-f", anchor])
+        else:
+            code, _ = _run_cmd(prefix + ["install", "-d", os.path.dirname(anchor)])
+            if code == 0:
+                code, _ = _run_cmd(prefix + ["install", "-m", "0644", ca.cert_path, anchor])
+        if code != 0:
+            sys.stderr.write(f"[{PROG}] could not {action} {anchor} (exit {code})\n")
+            rc = 2
+        elif update:
+            code, _ = _run_cmd(prefix + update)
+            if code != 0:
+                sys.stderr.write(f"[{PROG}] {update[0]} failed (exit {code})\n")
+                rc = 2
+        if code == 0:
+            verb = "removed from" if remove else "installed in"
+            sink.write(color.fg(f"  system trust: {verb} {anchor}", 42) + "\n")
+    if shutil.which("certutil"):
+        dirs = nss_dirs()
+        if dirs:
+            user_prefix = _session_prefix()
+            for db in dirs:
+                _run_cmd(user_prefix + ["certutil", "-d", "sql:" + db, "-D", "-n", MITM_CA_NAME],
+                         capture=True, timeout=30)
+                if not remove:
+                    code, out = _run_cmd(
+                        user_prefix + ["certutil", "-d", "sql:" + db, "-A", "-t", "C,,", "-n",
+                                       MITM_CA_NAME, "-i", ca.cert_path],
+                        capture=True, timeout=30,
+                    )
+                    if code != 0:
+                        sys.stderr.write(f"[{PROG}] certutil {db} failed: {out.strip()[:200]}\n")
+                        rc = 2
+                    else:
+                        sink.write(color.fg(f"  browser trust: {db}", 42) + "\n")
+        else:
+            sys.stderr.write(f"[{PROG}] no NSS database found (Firefox/Chromium not set up yet)\n")
+    else:
+        sys.stderr.write(f"[{PROG}] certutil not installed — Firefox/Chrome may need the CA manually\n")
+    if remove:
+        sink.write(color.dim("  restart browsers for the change to take effect") + "\n")
+    else:
+        sink.write(color.dim("  restart browsers; apps with certificate pinning will still refuse") + "\n")
+    return rc
+
+
+def show_ca(ca: CertAuthority, color: Color, stream: Optional[Any] = None) -> int:
+    sink = stream or sys.stdout
+    if not ca.exists():
+        sink.write(f"  CA not created yet: {ca.cert_path}\n")
+        sink.write(f"  it is created automatically by: {PROG} --mitm\n")
+        return 0
+    fp = ca.fingerprint()
+    sink.write(f"  CA certificate: {ca.cert_path}\n")
+    sink.write(f"  CA private key: {ca.key_path}  (keep this secret)\n")
+    if fp:
+        sink.write(f"  SHA-256:        {fp}\n")
+    sink.write(f"  trust it with:  {PROG} --mitm-ca-install\n")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+#  GNOME system proxy
+# --------------------------------------------------------------------------- #
+
+PROXY_KEYS = (
+    ("mode", "org.gnome.system.proxy mode"),
+    ("http_host", "org.gnome.system.proxy.http host"),
+    ("http_port", "org.gnome.system.proxy.http port"),
+    ("https_host", "org.gnome.system.proxy.https host"),
+    ("https_port", "org.gnome.system.proxy.https port"),
+    ("ignore_hosts", "org.gnome.system.proxy ignore-hosts"),
+)
+
+
+def proxy_state_path(ca_dir: str) -> str:
+    return os.path.join(ca_dir, "proxy-state.json")
+
+
+def _gsettings(spec: str, value: Optional[str] = None) -> Tuple[int, str]:
+    schema, key = spec.rsplit(" ", 1)
+    cmd = _session_prefix() + ["gsettings"]
+    cmd += ["get", schema, key] if value is None else ["set", schema, key, value]
+    return _run_cmd(cmd, capture=True, timeout=15)
+
+
+def set_system_proxy(ca_dir: str, host: str, port: int) -> Tuple[Optional[str], bool]:
+    """Point GNOME's proxy at us, saving the previous values. Returns (state path, ok)."""
+    path = proxy_state_path(ca_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    values: Dict[str, str] = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                saved = json.load(fh).get("values", {})
+            if isinstance(saved, dict) and all(name in saved for name, _ in PROXY_KEYS):
+                values = {str(k): str(v) for k, v in saved.items()}
+        except (OSError, ValueError, AttributeError):
+            values = {}
+    if not values:
+        for name, spec in PROXY_KEYS:
+            code, out = _gsettings(spec)
+            if code != 0:
+                return None, False
+            values[name] = out.strip()
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"created": time.time(), "values": values}, fh, indent=2)
+        except OSError:
+            return None, False
+    ignore = values.get("ignore_hosts", "[]").strip()
+    if ignore.startswith("@as "):
+        ignore = ignore[4:].strip()
+    try:
+        items = ast.literal_eval(ignore)
+        if not isinstance(items, list):
+            items = []
+    except (ValueError, SyntaxError):
+        items = []
+    for local in ("localhost", "127.0.0.1", "::1"):
+        if local not in items:
+            items.append(local)
+    quoted = "[" + ", ".join("'" + str(x).replace("'", "\\'") + "'" for x in items) + "]"
+    sets = [
+        ("org.gnome.system.proxy.http host", f"'{host}'"),
+        ("org.gnome.system.proxy.http port", str(port)),
+        ("org.gnome.system.proxy.https host", f"'{host}'"),
+        ("org.gnome.system.proxy.https port", str(port)),
+        ("org.gnome.system.proxy ignore-hosts", quoted),
+        ("org.gnome.system.proxy mode", "'manual'"),
+    ]
+    for spec, value in sets:
+        code, _ = _gsettings(spec, value)
+        if code != 0:
+            return path, False
+    return path, True
+
+
+def restore_system_proxy(ca_dir: str, color: Optional[Color] = None,
+                         stream: Optional[Any] = None) -> bool:
+    out = stream or sys.stdout
+    path = proxy_state_path(ca_dir)
+    if not os.path.isfile(path):
+        msg = "no saved proxy state to restore"
+        if color:
+            out.write(color.dim("  " + msg) + "\n")
+        else:
+            out.write("  " + msg + "\n")
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            values = json.load(fh).get("values", {})
+    except (OSError, ValueError, AttributeError):
+        return False
+    if not isinstance(values, dict):
+        return False
+    ok = True
+    # restore mode last, so intermediate host values are not live
+    for name, spec in reversed(PROXY_KEYS):
+        value = values.get(name)
+        if value is None:
+            continue
+        code, _ = _gsettings(spec, value)
+        if code != 0:
+            ok = False
+    if ok:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        out.write((color.fg("  system proxy restored", 42) if color else "  system proxy restored") + "\n")
+    else:
+        sys.stderr.write(f"[{PROG}] could not restore some proxy keys; state kept at {path}\n")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+#  the proxy itself
+# --------------------------------------------------------------------------- #
+
+class MitmProxy:
+    MAX_HEAD = 131072
+    MAX_CONNS = 512
+
+    def __init__(self, cfg: argparse.Namespace, ca: CertAuthority,
+                 out: "queue.Queue[Tuple[str, Any]]", proc: ProcMap) -> None:
+        self.cfg = cfg
+        self.ca = ca
+        self.out = out
+        self.proc = proc
+        self.listen = cfg.mitm_listen or "127.0.0.1"
+        self.port = int(cfg.mitm_port) if cfg.mitm_port is not None else 8080
+        self.timeout = max(1.0, float(cfg.mitm_timeout))
+        self.stop_event = threading.Event()
+        self.server: Optional[socket.socket] = None
+        self.thread: Optional[threading.Thread] = None
+        self._conns: set = set()
+        self._conn_lock = threading.Lock()
+        self._proc_lock = threading.Lock()
+        self._client_cache: Dict[Tuple[str, int], Tuple[float, Optional[int], str]] = {}
+        self._ignore = [p.lower() for p in (cfg.mitm_ignore or [])]
+
+    # -- lifecycle --------------------------------------------------------- #
+    def start(self) -> None:
+        family = socket.AF_INET6 if ":" in self.listen else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        sock.bind((self.listen, self.port))
+        self.port = sock.getsockname()[1]
+        sock.listen(128)
+        sock.settimeout(0.4)
+        self.server = sock
+        self.thread = threading.Thread(target=self._accept_loop, name="mitm-accept", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.server is not None:
+            try:
+                self.server.close()
+            except OSError:
+                pass
+        with self._conn_lock:
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+    # -- accept / dispatch ------------------------------------------------- #
+    def _accept_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                conn, addr = self.server.accept()  # type: ignore[union-attr]
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with self._conn_lock:
+                too_many = len(self._conns) >= self.MAX_CONNS
+                if not too_many:
+                    self._conns.add(conn)
+            if too_many:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            threading.Thread(target=self._handle_safe, args=(conn, addr),
+                             name="mitm-conn", daemon=True).start()
+
+    def _handle_safe(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        try:
+            conn.settimeout(self.timeout)
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            self._handle(conn, addr)
+        except (ssl.SSLError, _ProtocolError, EOFError, socket.timeout, OSError) as exc:
+            if self.cfg.verbose:
+                sys.stderr.write(f"[{PROG}] mitm: {type(exc).__name__}: {exc}\n")
+        except Exception as exc:                       # a proxy thread must never take the app down
+            if self.cfg.verbose:
+                sys.stderr.write(f"[{PROG}] mitm: unexpected {type(exc).__name__}: {exc}\n")
+        finally:
+            with self._conn_lock:
+                self._conns.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _handle(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        reader = _Reader(conn)
+        head = reader.read_until(b"\r\n\r\n", self.MAX_HEAD)
+        if not head.endswith(b"\r\n\r\n"):
+            return
+        method, target, version, headers = parse_request_head(head)
+        client_info = self._client_info(addr)
+
+        if method == "CONNECT":
+            host, port = split_host_port(target, 443)
+            if not host:
+                return
+            self._send(conn, b"HTTP/1.1 200 Connection established\r\nProxy-Agent: netlogger\r\n\r\n")
+            if self._ignored(host):
+                self._tunnel(conn, addr, host, port, client_info, method="CONNECT", scheme="tcp",
+                             notes=["pass-through (not decrypted)"])
+                return
+            try:
+                first = conn.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return
+            if not first:
+                return
+            if first[0] not in (0x16, 0x80):
+                self._tunnel(conn, addr, host, port, client_info, method="CONNECT", scheme="tcp",
+                             notes=["not TLS — tunneled"])
+                return
+            try:
+                tls = self._wrap_client(conn, host)
+            except ssl.SSLError:
+                self._emit(method="CONNECT", scheme="tcp", host=host, port=port,
+                           path="-", query="", status=0, client_info=client_info,
+                           client_addr=addr, bytes_in=0, bytes_out=0, duration=0.0,
+                           tls="", alpn="", app="TCP",
+                           notes=["TLS handshake failed — certificate pinning?"])
+                return
+            try:
+                self._serve_http(_Reader(tls), tls, addr, client_info, "https", host, port, fixed=True)
+            finally:
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+            return
+
+        scheme, host, path, port = self._request_target(target, headers)
+        if not host:
+            raise _ProtocolError("no host in request")
+        self._serve_http(reader, conn, addr, client_info, scheme, host, port, fixed=False,
+                         first=(method, target, version, headers, head))
+
+    def _request_target(self, target: str, headers: Sequence[Tuple[str, str]]) -> Tuple[str, str, str, int]:
+        hdrs = header_dict(headers)
+        if target.startswith(("http://", "https://")):
+            scheme, host, path, port = absolute_target(target)
+        else:
+            scheme = "http"
+            host = hdrs.get("host", "")
+            path = target
+            port = 80
+            if host:
+                host, port = split_host_port(host, 80)
+        if not host and hdrs.get("host"):
+            host, port = split_host_port(hdrs["host"], 80)
+        return scheme, host, path, port
+
+    def _serve_http(self, reader: _Reader, sock: Any, client_addr: Tuple[str, int],
+                    client_info: Tuple[Optional[int], str],
+                    scheme: str, host: str, port: int, *, fixed: bool,
+                    first: Optional[Tuple[str, str, str, List[Tuple[str, str]], bytes]] = None) -> None:
+        req = first
+        for _ in range(10000):
+            if req is None:
+                head = reader.read_until(b"\r\n\r\n", self.MAX_HEAD)
+                if not head.endswith(b"\r\n\r\n"):
+                    return
+                method, target, version, headers = parse_request_head(head)
+                req = (method, target, version, headers, head)
+            method, target, version, headers, head = req
+            req = None
+            if fixed:
+                if target.startswith(("http://", "https://")):
+                    _sch, host, path, port = absolute_target(target)
+                else:
+                    path = target
+                h, p = host, port
+                req_scheme = scheme
+            else:
+                req_scheme, h, path, p = self._request_target(target, headers)
+            keep = self._handle_request(reader, sock, client_addr, client_info, req_scheme, h, p,
+                                        method, path, version, headers, head)
+            if not keep:
+                return
+
+    # -- one HTTP exchange ------------------------------------------------- #
+    def _handle_request(self, reader: _Reader, client: Any, client_addr: Tuple[str, int],
+                        client_info: Tuple[Optional[int], str],
+                        scheme: str, host: str, port: int, method: str, path: str,
+                        version: str, headers: List[Tuple[str, str]], head: bytes) -> bool:
+        t0 = time.time()
+        hdrs = header_dict(headers)
+        ws = hdrs.get("upgrade", "").lower() == "websocket"
+        app_name = ("WSS" if scheme == "wss" else "WS") if ws else ""
+        tls_ver = _socket_tls_version(client) if scheme in ("https", "wss") else ""
+        alpn = _socket_alpn(client) if tls_ver else ""
+        notes: List[str] = []
+        origin = _origin_form(path)
+        bytes_out = len(head)
+        bytes_in = 0
+        status = 0
+        server_ip = ""
+
+        if self.cfg.live:
+            op, oq = _split_path_query(origin)
+            self.out.put(("partial", self._record(
+                t0, method, scheme, host, port, op, oq, 0, "", None,
+                bytes_in=0, bytes_out=len(head), client_info=client_info,
+                client_addr=client_addr, server_ip="", tls=tls_ver, alpn=alpn,
+                notes=[], app=app_name,
+            )))
+
+        # strip Expect and answer it ourselves, avoiding a 100-continue deadlock
+        expect = "100-continue" in hdrs.get("expect", "").lower()
+        fwd_headers = [(k, v) for k, v in headers if k.lower() != "expect"] if expect else list(headers)
+        fwd_headers = sanitise_headers(fwd_headers)
+        if "chunked" in hdrs.get("transfer-encoding", "").lower():
+            fwd_headers = [(k, v) for k, v in fwd_headers if k.lower() != "content-length"]
+        upstream = None
+        try:
+            upstream = self._connect_upstream(host, port, scheme in ("https", "wss"))
+            server_ip = upstream.getpeername()[0]
+            out_head = build_head(f"{method} {origin} {version}", fwd_headers,
+                                  host=host, default_port=port)
+            upstream.sendall(out_head)
+            if expect:
+                self._send(client, b"HTTP/1.1 100 Continue\r\n\r\n")
+            bytes_out += self._relay_request_body(reader, upstream, header_dict(fwd_headers))
+
+            up_reader = _Reader(upstream)
+            reason = ""
+            rhdrs: List[Tuple[str, str]] = []
+            resp_version = "HTTP/1.1"
+            while True:
+                resp_head = up_reader.read_until(b"\r\n\r\n", self.MAX_HEAD)
+                if not resp_head.endswith(b"\r\n\r\n"):
+                    raise _ProtocolError("short response head")
+                try:
+                    resp_version = resp_head.split(b" ", 1)[0].decode("latin-1")
+                except Exception:
+                    resp_version = "HTTP/1.1"
+                status, reason, rhdrs = parse_response_head(resp_head)
+                self._send(client, resp_head)
+                bytes_in += len(resp_head)
+                if 100 <= status < 200 and status != 101:
+                    continue
+                break
+            resp_hdrs = header_dict(rhdrs)
+
+            if status == 101:
+                # bytes that arrived together with the 101 / request head are
+                # already buffered in the _Reader objects; do not lose them.
+                if reader.buf:
+                    early = bytes(reader.buf)
+                    reader.buf.clear()
+                    self._send(upstream, early)
+                    bytes_out += len(early)
+                if up_reader.buf:
+                    early = bytes(up_reader.buf)
+                    up_reader.buf.clear()
+                    self._send(client, early)
+                    bytes_in += len(early)
+                op, oq = _split_path_query(origin)
+                self._tunnel_sockets(
+                    client, upstream, client_addr=client_addr, client_info=client_info,
+                    host=host, port=port,
+                    scheme=("wss" if scheme in ("https", "wss") else "ws") if ws else scheme,
+                    method=method, app=app_name or "TCP", t0=t0,
+                    bytes_in=bytes_in, bytes_out=bytes_out,
+                    notes=notes + ["upgraded"], server_ip=server_ip, tls=tls_ver, alpn=alpn,
+                    path=op, query=oq, status=status,
+                    content_type=resp_hdrs.get("content-type", ""),
+                    content_length=_int_or_none(resp_hdrs.get("content-length")),
+                )
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+                upstream = None
+                return False
+
+            eof_delimited = _body_is_eof(status, resp_hdrs, method)
+            bytes_in += self._relay_response_body(up_reader, client, method, status, resp_hdrs)
+            op, oq = _split_path_query(origin)
+            self._emit(
+                method=method, scheme=scheme, host=host, port=port, path=op, query=oq,
+                status=status, client_info=client_info, client_addr=client_addr,
+                bytes_in=bytes_in, bytes_out=bytes_out,
+                duration=time.time() - t0, tls=tls_ver, alpn=alpn,
+                content_type=resp_hdrs.get("content-type", ""),
+                content_length=_int_or_none(resp_hdrs.get("content-length")),
+                notes=notes, server_ip=server_ip, app=app_name,
+            )
+
+            close = _connection_close(version, hdrs) or _connection_close(resp_version, resp_hdrs)
+            if eof_delimited:
+                close = True
+            return not close
+        except (OSError, EOFError, _ProtocolError, ssl.SSLError) as exc:
+            notes.append(f"error: {_short_err(exc)}")
+            if not status:
+                self._reply_error(client, 502, "Bad Gateway")
+            op, oq = _split_path_query(origin)
+            self._emit(
+                method=method, scheme=scheme, host=host, port=port, path=op, query=oq,
+                status=status, client_info=client_info, client_addr=client_addr,
+                bytes_in=bytes_in, bytes_out=bytes_out,
+                duration=time.time() - t0, tls=tls_ver, alpn=alpn,
+                notes=notes, server_ip=server_ip, app=app_name,
+            )
+            return False
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+    def _relay_request_body(self, reader: _Reader, upstream: Any, hdrs: Dict[str, str]) -> int:
+        if "chunked" in hdrs.get("transfer-encoding", "").lower():
+            return _relay_chunked(reader, upstream)
+        raw_cl = hdrs.get("content-length")
+        if raw_cl is not None:
+            n = _int_or_none(raw_cl)
+            if n is None or n < 0:
+                raise _ProtocolError("bad content-length")
+            return _relay_exact(reader, upstream, n) if n else 0
+        return 0
+
+    def _relay_response_body(self, reader: _Reader, client: Any, method: str,
+                             status: int, hdrs: Dict[str, str]) -> int:
+        if method == "HEAD" or status in (204, 205, 304) or 100 <= status < 200:
+            return 0
+        if "chunked" in hdrs.get("transfer-encoding", "").lower():
+            return _relay_chunked(reader, client)
+        n = _int_or_none(hdrs.get("content-length"))
+        if n is not None:
+            if n < 0:
+                raise _ProtocolError("bad content-length")
+            return _relay_exact(reader, client, n)
+        return _relay_to_eof(reader, client)
+
+    # -- tunnels ----------------------------------------------------------- #
+    def _tunnel(self, client: Any, client_addr: Tuple[str, int], host: str, port: int,
+                client_info: Tuple[Optional[int], str], *, method: str, scheme: str,
+                notes: List[str]) -> None:
+        t0 = time.time()
+        try:
+            upstream = self._connect_upstream(host, port, False)
+        except OSError as exc:
+            self._emit(method=method, scheme=scheme, host=host, port=port,
+                       path="-", query="", status=0, client_info=client_info,
+                       client_addr=client_addr, bytes_in=0, bytes_out=0, duration=0.0,
+                       tls="", alpn="", app="TCP",
+                       notes=notes + [f"error: {_short_err(exc)}"])
+            return
+        try:
+            if self.cfg.live:
+                self.out.put(("partial", self._record(
+                    t0, method, scheme, host, port, "-", "", 0, "", None,
+                    bytes_in=0, bytes_out=0, client_info=client_info,
+                    client_addr=client_addr, server_ip=upstream.getpeername()[0],
+                    tls="", alpn="", notes=notes, app="TCP",
+                )))
+            self._tunnel_sockets(client, upstream, client_addr=client_addr,
+                                 client_info=client_info, host=host, port=port,
+                                 scheme=scheme, method=method, app="TCP", t0=t0,
+                                 bytes_in=0, bytes_out=0, notes=notes,
+                                 server_ip=upstream.getpeername()[0], tls="", alpn="",
+                                 path="-", query="", status=0)
+        finally:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+
+    def _tunnel_sockets(self, client: Any, upstream: Any, *, client_addr: Tuple[str, int],
+                        client_info: Tuple[Optional[int], str],
+                        host: str, port: int, scheme: str, method: str, app: str, t0: float,
+                        bytes_in: int, bytes_out: int, notes: List[str],
+                        server_ip: str, tls: str, alpn: str,
+                        path: str = "-", query: str = "", status: int = 0,
+                        content_type: str = "", content_length: Optional[int] = None) -> None:
+        sockets = [client, upstream]
+        idle = self.timeout
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    ready, _, _ = select.select(sockets, [], [], idle)
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    notes.append("idle timeout")
+                    break
+                for src in ready:
+                    try:
+                        data = src.recv(65536)
+                    except ssl.SSLWantReadError:
+                        continue
+                    except OSError:
+                        data = b""
+                    if not data:
+                        return
+                    dst = upstream if src is client else client
+                    try:
+                        dst.sendall(data)
+                    except OSError:
+                        return
+                    if src is client:
+                        bytes_out += len(data)
+                    else:
+                        bytes_in += len(data)
+        finally:
+            self._emit(method=method, scheme=scheme, host=host, port=port, path=path,
+                       query=query, status=status, client_info=client_info,
+                       client_addr=client_addr, bytes_in=bytes_in, bytes_out=bytes_out,
+                       duration=time.time() - t0, tls=tls, alpn=alpn, notes=notes,
+                       server_ip=server_ip, app=app,
+                       content_type=content_type, content_length=content_length)
+
+    # -- helpers ----------------------------------------------------------- #
+    def _wrap_client(self, conn: socket.socket, host: str) -> ssl.SSLSocket:
+        ctx = self.ca.leaf_context(host)
+
+        def _sni(sslobj: Any, server_name: Optional[str], _ctx: Any) -> None:
+            if server_name:
+                try:
+                    sslobj.context = self.ca.leaf_context(server_name)
+                except Exception:
+                    pass
+
+        ctx.set_servername_callback(_sni)
+        return ctx.wrap_socket(conn, server_side=True)
+
+    def _connect_upstream(self, host: str, port: int, tls: bool) -> Any:
+        raw = socket.create_connection((host, port), timeout=self.timeout)
+        raw.settimeout(self.timeout)
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if not tls:
+            return raw
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["http/1.1"])
+        if self.cfg.mitm_insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        try:
+            return ctx.wrap_socket(raw, server_hostname=host)
+        except Exception:
+            try:
+                raw.close()
+            except OSError:
+                pass
+            raise
+
+    def _ignored(self, host: str) -> bool:
+        if not self._ignore:
+            return False
+        return Filters._pat_match(host, self._ignore)
+
+    def _send(self, sock: Any, data: bytes) -> None:
+        sock.sendall(data)
+
+    def _reply_error(self, client: Any, code: int, text: str) -> None:
+        body = f"{code} {text}\n".encode()
+        try:
+            client.sendall(
+                f"HTTP/1.1 {code} {text}\r\nContent-Type: text/plain\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+            )
+        except OSError:
+            pass
+
+    def _client_info(self, addr: Tuple[str, int]) -> Tuple[Optional[int], str]:
+        ip = norm_ip(addr[0])
+        port = int(addr[1])
+        key = (ip, port)
+        now = time.time()
+        hit = self._client_cache.get(key)
+        if hit and now - hit[0] < 30.0:
+            return hit[1], hit[2]
+        found: Optional[Tuple[int, str]] = None
+        if self.proc.available:
+            with self._proc_lock:
+                found = self.proc.lookup_fresh("tcp", ip, port)
+        info = found or (None, "")
+        if len(self._client_cache) > 2000:
+            self._client_cache.clear()
+        self._client_cache[key] = (now, info[0], info[1])
+        return info
+
+    def _record(self, t0: float, method: str, scheme: str, host: str, port: int,
+                path: str, query: str, status: int, content_type: str,
+                content_length: Optional[int], *, bytes_in: int, bytes_out: int,
+                client_info: Tuple[Optional[int], str], client_addr: Tuple[str, int],
+                server_ip: str, tls: str, alpn: str, notes: List[str], app: str = "") -> Record:
+        rec = Record(ts=t0)
+        rec.method = method
+        rec.scheme = scheme
+        rec.host = host
+        rec.path = path
+        rec.query = query
+        rec.status = status
+        rec.content_type = content_type
+        rec.content_length = content_length
+        rec.bytes_in = int(bytes_in)
+        rec.bytes_out = int(bytes_out)
+        rec.duration = max(0.0, time.time() - t0)
+        rec.pid, rec.pname = client_info
+        if client_addr and client_addr[0]:
+            rec.client = str(Endpoint(norm_ip(client_addr[0]), int(client_addr[1])))
+        rec.server_ip = server_ip
+        if server_ip:
+            rec.server = str(Endpoint(norm_ip(server_ip), int(port)))
+        rec.server_port = port
+        rec.show_port = port not in (80, 443, 53)
+        rec.tls = tls
+        rec.alpn = alpn
+        rec.sni = host if scheme in ("https", "wss") else ""
+        rec.notes = list(notes)
+        if app:
+            rec.app = app
+        elif scheme == "https":
+            rec.app = "HTTPS"
+        else:
+            rec.app = "HTTP"
+        return rec
+
+    def _emit(self, *, method: str, scheme: str, host: str, port: int, path: str, query: str,
+              status: int, client_info: Tuple[Optional[int], str],
+              client_addr: Tuple[str, int], bytes_in: int, bytes_out: int,
+              duration: float, tls: str, alpn: str, notes: List[str],
+              content_type: str = "", content_length: Optional[int] = None,
+              server_ip: str = "", app: str = "") -> None:
+        rec = self._record(time.time() - max(0.0, duration), method, scheme, host, port,
+                           path, query, status, content_type, content_length,
+                           bytes_in=bytes_in, bytes_out=bytes_out, client_info=client_info,
+                           client_addr=client_addr, server_ip=server_ip,
+                           tls=tls, alpn=alpn, notes=notes, app=app)
+        rec.duration = max(0.0, duration)
+        self.out.put(("rec", rec))
+
+
+def _socket_tls_version(sock: Any) -> str:
+    try:
+        v = sock.version() or ""
+    except (AttributeError, OSError):
+        return ""
+    return v.replace("TLSv", "").replace("SSLv", "")
+
+
+def _socket_alpn(sock: Any) -> str:
+    try:
+        return sock.selected_alpn_protocol() or ""
+    except (AttributeError, OSError):
+        return ""
+
+
+def _int_or_none(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _connection_close(version: str, hdrs: Dict[str, str]) -> bool:
+    conn = hdrs.get("connection", "").lower()
+    if "close" in conn:
+        return True
+    if str(version).upper().startswith("HTTP/1.0") and "keep-alive" not in conn:
+        return True
+    return False
+
+
+def _body_is_eof(status: int, hdrs: Dict[str, str], method: str) -> bool:
+    if method == "HEAD" or status in (204, 205, 304) or 100 <= status < 200:
+        return False
+    if "chunked" in hdrs.get("transfer-encoding", "").lower():
+        return False
+    return _int_or_none(hdrs.get("content-length")) is None
+
+
+def _short_err(exc: BaseException) -> str:
+    text = str(exc).strip().replace("\n", " ")
+    if not text:
+        text = type(exc).__name__
+    return text[:120]
+
+
+def mitm_env(ca: CertAuthority, port: int, listen: str) -> Dict[str, str]:
+    host = listen
+    if host in ("0.0.0.0", "", "::"):
+        host = "::1" if ":" in listen else "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    url = f"http://{host}:{port}"
+    no_proxy = "localhost,127.0.0.1,::1"
+    cert = ca.cert_path
+    return {
+        "http_proxy": url, "https_proxy": url, "all_proxy": url,
+        "HTTP_PROXY": url, "HTTPS_PROXY": url, "ALL_PROXY": url,
+        "no_proxy": no_proxy, "NO_PROXY": no_proxy,
+        "SSL_CERT_FILE": cert, "CURL_CA_BUNDLE": cert, "REQUESTS_CA_BUNDLE": cert,
+        "NODE_EXTRA_CA_CERTS": cert, "GIT_SSL_CAINFO": cert, "PIP_CERT": cert,
+    }
+
+
+def _pump(out: "queue.Queue[Tuple[str, Any]]", emitter: Emitter, stats: Stats,
+          cfg: argparse.Namespace, timeout: float = 0.15) -> None:
+    deadline = time.time() + timeout
+    while True:
+        try:
+            kind, payload = out.get(timeout=max(0.0, deadline - time.time()))
+        except queue.Empty:
+            return
+        if kind == "rec":
+            emitter.emit(payload, False)
+        elif kind == "partial":
+            emitter.emit(payload, True)
+        elif kind == "note":
+            if len(stats.errors) < 20:
+                stats.errors.append(str(payload))
+            if cfg.verbose:
+                sys.stderr.write(f"[{PROG}] {payload}\n")
+
+
+def _child_env(env: Dict[str, str]) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Environment and Popen kwargs that run the child as the invoking user."""
+    run_env = os.environ.copy()
+    run_env.update(env)
+    info = _target_uid_gid()
+    if info is None or sys.version_info < (3, 9):
+        return run_env, {}
+    uid, gid, home = info
+    try:
+        groups = os.getgrouplist(os.environ.get("SUDO_USER", ""), gid)
+    except (OSError, KeyError):
+        groups = None
+    run_env.update({"HOME": home, "USER": os.environ.get("SUDO_USER", ""),
+                    "LOGNAME": os.environ.get("SUDO_USER", "")})
+    runtime = f"/run/user/{uid}"
+    if os.path.isdir(runtime):
+        run_env["XDG_RUNTIME_DIR"] = runtime
+        run_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime}/bus"
+    kwargs: Dict[str, Any] = {"user": uid, "group": gid}
+    if groups:
+        kwargs["extra_groups"] = groups
+    return run_env, kwargs
+
+
+def _run_child(cfg: argparse.Namespace, envinfo: Dict[str, str],
+               emitter: Emitter, out: "queue.Queue[Tuple[str, Any]]", stats: Stats,
+               stop: Dict[str, bool], deadline: Optional[float]) -> int:
+    cmd = [str(x) for x in (cfg.command or [])]
+    while cmd and cmd[0] == "--":
+        cmd.pop(0)
+    if not cmd:
+        return 0
+    run_env, kwargs = _child_env(envinfo)
+    try:
+        proc = subprocess.Popen(cmd, env=run_env, **kwargs)
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(f"[{PROG}] cannot run {cmd[0]}: {exc}\n")
+        return 2
+    code = 0
+    stop_reason = ""
+    try:
+        while proc.poll() is None:
+            if stop["stop"]:
+                stop_reason = "signal"
+                break
+            if deadline and time.time() >= deadline:
+                stop_reason = "duration"
+                emitter.banner("duration reached — stopping the app")
+                break
+            if cfg.count and stats.records >= cfg.count:
+                stop_reason = "count"
+                emitter.banner("count reached — stopping the app")
+                break
+            _pump(out, emitter, stats, cfg, 0.1)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        code = proc.returncode or 0
+        if stop_reason == "signal":
+            code = 130
+        elif stop_reason:
+            code = 0
+        elif code < 0:
+            code = 128 - code
+        end = time.time() + 0.4
+        while time.time() < end:
+            _pump(out, emitter, stats, cfg, 0.1)
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    return code
+
+
+def mitm_capture(cfg: argparse.Namespace, color: Color, ca: CertAuthority) -> int:
+    stats = Stats()
+    emitter = Emitter(cfg, color, stats)
+    try:
+        ca.ensure()
+    except RuntimeError as exc:
+        sys.stderr.write(f"[{PROG}] error: {exc}\n")
+        return 2
+
+    out: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+    proc = ProcMap()
+    proxy = MitmProxy(cfg, ca, out, proc)
+    try:
+        proxy.start()
+    except OSError as exc:
+        sys.stderr.write(f"[{PROG}] cannot listen on {cfg.mitm_listen}:{cfg.mitm_port}: {exc}\n")
+        return 2
+
+    state = {"stop": False}
+    restored = {"done": False}
+    saved_state: Optional[str] = None
+
+    def cleanup() -> None:
+        if restored["done"]:
+            return
+        restored["done"] = True
+        proxy.stop()
+        if saved_state:
+            restore_system_proxy(ca.dir, color, stream=sys.stderr)
+
+    def on_signal(_signum: int, _frame: Any) -> None:
+        if state["stop"]:
+            cleanup()
+            os._exit(130)
+        state["stop"] = True
+        emitter.banner("stopping…")
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    env = mitm_env(ca, proxy.port, proxy.listen)
+    if cfg.mitm_system:
+        proxy_host = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(
+            proxy.listen, proxy.listen)
+        saved_state, system_ok = set_system_proxy(ca.dir, proxy_host, proxy.port)
+        if system_ok:
+            emitter.banner("system proxy switched to manual — restored on exit")
+        else:
+            emitter.banner("could not change the GNOME proxy; use the env below")
+
+    if not cfg.quiet:
+        emitter.banner(f"MITM proxy on {env['https_proxy']} · CA {ca.cert_path}")
+        emitter.banner("no root needed · TLS is terminated locally · full paths are logged")
+        emitter.banner("this shell:  export " +
+                       " ".join(f"{k}={shlex.quote(v)}" for k, v in
+                                ((k, env[k]) for k in ("HTTPS_PROXY", "HTTP_PROXY", "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"))))
+        if cfg.mitm_system:
+            emitter.banner(f"if this process is killed hard: {PROG} --mitm-restore")
+        if cfg.mitm_insecure:
+            emitter.banner("warning: upstream TLS certificates are NOT verified (--mitm-insecure)")
+        if proxy.listen in ("0.0.0.0", "::"):
+            emitter.banner("warning: listening on every interface — anyone who can reach this port can use it")
+        if cfg.pcap:
+            emitter.banner("--pcap is ignored in MITM mode (no raw packets are captured)")
+        emitter.banner("the CA private key is sensitive; undo trust with: " + f"{PROG} --mitm-ca-remove")
+        emitter.banner("certificate pinning will make some apps refuse the connection")
+        if not cfg.command:
+            emitter.banner(f"other apps need the CA trusted: {PROG} --mitm-ca-install")
+            emitter.banner("press Ctrl-C to stop")
+
+    command = [str(x) for x in (cfg.command or [])]
+    while command and command[0] == "--":
+        command.pop(0)
+    deadline = time.time() + cfg.duration if cfg.duration > 0 else None
+    last_stats = time.time()
+    exit_code = 0
+    try:
+        if command:
+            emitter.banner("running: " + " ".join(command))
+            exit_code = _run_child(cfg, env, emitter, out, stats, state, deadline)
+        else:
+            while not state["stop"]:
+                _pump(out, emitter, stats, cfg, 0.15)
+                if deadline and time.time() >= deadline:
+                    break
+                if cfg.count and stats.records >= cfg.count:
+                    break
+                if cfg.stats_interval > 0 and time.time() - last_stats >= cfg.stats_interval:
+                    last_stats = time.time()
+                    sys.stderr.write(
+                        f"[{PROG}] {stats.records} fetches · ↓ {human_bytes(stats.bytes_in, cfg.binary)}"
+                        f" ↑ {human_bytes(stats.bytes_out, cfg.binary)} · port {proxy.port}\n"
+                    )
+                    sys.stderr.flush()
+    finally:
+        cleanup()
+        _pump(out, emitter, stats, cfg, 0.3)
+        if not cfg.quiet and not cfg.no_summary:
+            dest = sys.stderr if cfg.format in ("json", "csv") else sys.stdout
+            dest.write(stats.summary(color, cfg.binary, emitter.width()) + "\n")
+            dest.flush()
+    return exit_code
+
+
 def demo(args: argparse.Namespace, color: Color) -> int:
     """Offline preview; needs no root and no traffic."""
     stats = Stats()
@@ -2296,6 +4077,26 @@ def selftest(verbose: bool = False) -> int:
     if pm.available and not isinstance(pm._sockets, dict):
         failures.append("ProcMap._sockets")
 
+    # MITM helpers
+    checks += 1
+    if split_host_port("example.com:8443") != ("example.com", 8443) or \
+            split_host_port("[::1]:9443") != ("::1", 9443) or \
+            split_host_port("example.com:bad", 80) != ("example.com", 80):
+        failures.append("split_host_port")
+    checks += 1
+    if absolute_target("https://example.com/a/b?x=1") != ("https", "example.com", "/a/b?x=1", 443):
+        failures.append(f"absolute_target -> {absolute_target('https://example.com/a/b?x=1')}")
+    checks += 1
+    _m, _t, _v, _h = parse_request_head(
+        b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n")
+    if (_m, _t, header_dict(_h).get("host")) != ("POST", "/x", "h"):
+        failures.append("parse_request_head (proxy)")
+    checks += 1
+    if _body_is_eof(200, {}, "GET") is not True or \
+            _body_is_eof(200, {"content-length": "2"}, "GET") is not False or \
+            _body_is_eof(204, {}, "GET") is not False:
+        failures.append("_body_is_eof")
+
     total = checks + len(failures)
     if failures:
         print(f"selftest: {checks} passed, {len(failures)} FAILED")
@@ -2336,26 +4137,37 @@ examples:
   sudo netlogger.py --host '*.zip' --app curl
   sudo netlogger.py --method GET,POST --min-size 1M
   sudo netlogger.py -f json | jq .           machine readable
-  sudo netlogger.py -o fetches.csv -f csv    keep a spread sheet friendly log
+  sudo netlogger.py -o fetches.csv -f csv    keep a spreadsheet friendly log
   sudo netlogger.py --pcap dump.pcap         also save the raw frames
   netlogger.py --demo                        preview without root
   netlogger.py --selftest                    check the parsers
 
+  netlogger.py --mitm                        local proxy: full HTTPS URLs, no root
+  netlogger.py --mitm -- curl https://x/y    proxy one command (CA + env set)
+  netlogger.py --mitm --mitm-system          point GNOME's proxy at it
+  netlogger.py --mitm-ca-install             trust the CA (system + Firefox/Chrome)
+  netlogger.py --mitm-restore                undo --mitm-system after a hard kill
+
 badges:
-  GET/POST/PUT/…  HTTP method (plain HTTP only)
+  GET/POST/PUT/…  HTTP method (plain HTTP, or HTTPS with --mitm)
   WS / WSS        websocket
   HTTPS           TLS session, host from SNI (path is encrypted)
   H2 / H3 / QUIC  HTTP/2 or HTTP/3
+  CONN            a raw tunnel (CONNECT / SSH / ignored pinned host)
   DNS             name lookup (only with --dns)
   SSH/SMB/…       guessed from the port, shown for big enough flows
 
 notes:
-  · HTTPS paths cannot be seen — TLS hides them. You still get the host (SNI),
-    the bytes used and the owning process.
+  · Without --mitm, HTTPS paths cannot be seen — TLS hides them. You still get
+    the host (SNI), the bytes used and the owning process.
+  · With --mitm, netlogger terminates TLS locally with its own CA, so you get
+    the full URL, method, status and sizes. Apps that pin certificates will
+    refuse the connection (use --mitm-ignore for those).
   · traffic numbers count application payload (what the app sent/received),
     HTTP headers are included, IP/TCP framing is not.
-  · needs root or CAP_NET_RAW; virtual bridge interfaces are skipped by default
-    so packets seen on both eth0 and docker0 are not counted twice.
+  · packet capture needs root or CAP_NET_RAW; --mitm needs no root. Virtual
+    bridge interfaces are skipped by default so packets seen on both eth0 and
+    docker0 are not counted twice.
 """)
     p.add_argument("-i", "--interface", action="append", metavar="IFACE",
                    help="capture only this interface (repeatable)")
@@ -2419,12 +4231,42 @@ notes:
                    help="print a one line running total to stderr every SECS")
     g.add_argument("--pcap", metavar="FILE", help="also write raw frames to a pcap file")
 
+    g = p.add_argument_group("MITM proxy — full URLs for HTTPS (no root needed)")
+    g.add_argument("--mitm", action="store_true",
+                   help="run a local TLS-terminating proxy: see full HTTPS URLs, methods and status")
+    g.add_argument("--mitm-port", type=int, default=8080, metavar="PORT",
+                   help="proxy port (default 8080; 0 = pick a free one)")
+    g.add_argument("--mitm-listen", default="127.0.0.1", metavar="ADDR",
+                   help="proxy listen address (default 127.0.0.1)")
+    g.add_argument("--mitm-system", action="store_true",
+                   help="also point GNOME's system proxy at it (restored on exit)")
+    g.add_argument("--mitm-restore", action="store_true",
+                   help="restore the system proxy saved by --mitm-system, then exit")
+    g.add_argument("--mitm-ca-install", action="store_true",
+                   help="trust the generated CA system-wide and in Firefox/Chrome")
+    g.add_argument("--mitm-ca-remove", action="store_true",
+                   help="remove the generated CA from system and browser stores")
+    g.add_argument("--mitm-ca-show", action="store_true",
+                   help="show the CA certificate path and SHA-256 fingerprint")
+    g.add_argument("--mitm-ca-reset", action="store_true",
+                   help="delete the generated CA and cached leaf certificates")
+    g.add_argument("--mitm-ca-dir", metavar="DIR", default="",
+                   help="CA directory (default ~/.config/netlogger/mitm)")
+    g.add_argument("--mitm-insecure", action="store_true",
+                   help="do not verify upstream TLS certificates (testing only)")
+    g.add_argument("--mitm-ignore", action="append", metavar="PATTERN",
+                   help="pass hosts matching PATTERN through untouched (certificate pinning)")
+    g.add_argument("--mitm-timeout", type=float, default=60.0, metavar="SECS",
+                   help="idle timeout for proxy connections (default 60)")
+
     g = p.add_argument_group("misc")
     g.add_argument("--list-interfaces", action="store_true", help="show interfaces and exit")
     g.add_argument("--demo", action="store_true", help="synthetic colourful demo, no root needed")
     g.add_argument("--selftest", action="store_true", help="run offline parser checks and exit")
     g.add_argument("-v", "--verbose", action="store_true", help="more chatter on stderr")
     g.add_argument("-V", "--version", action="version", version=f"{PROG} {__version__}")
+    p.add_argument("command", nargs=argparse.REMAINDER, metavar="-- CMD",
+                   help="with --mitm: run CMD with the proxy environment and CA exported")
     return p
 
 
@@ -2578,8 +4420,9 @@ def capture(cfg: argparse.Namespace, color: Color) -> int:
         if pcap:
             pcap.close()
         if not cfg.quiet and not cfg.no_summary:
-            sys.stdout.write(stats.summary(color, cfg.binary, emitter.width()) + "\n")
-            sys.stdout.flush()
+            dest = sys.stderr if cfg.format in ("json", "csv") else sys.stdout
+            dest.write(stats.summary(color, cfg.binary, emitter.width()) + "\n")
+            dest.flush()
     return 0
 
 
@@ -2598,6 +4441,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.demo:
         return demo(args, color)
 
+    ca = CertAuthority(args.mitm_ca_dir or mitm_default_dir())
+
+    if args.mitm_restore:
+        ok = restore_system_proxy(ca.dir, color)
+        # nothing to restore is not an error; a state file we could not apply is
+        return 0 if ok or not os.path.exists(proxy_state_path(ca.dir)) else 2
+
+    if args.mitm_ca_show:
+        show_ca(ca, color, stream=sys.stderr if args.mitm and args.format in ("json", "csv") else None)
+        if not args.mitm:
+            return 0
+    if args.mitm_ca_reset:
+        ca.reset()
+        reset_out = sys.stderr if args.mitm and args.format in ("json", "csv") else sys.stdout
+        reset_out.write(f"[{PROG}] CA and cached leaf certificates removed from {ca.dir}\n")
+        reset_out.write(f"[{PROG}] existing trust entries remain; remove them with --mitm-ca-remove\n")
+        if not (args.mitm or args.mitm_ca_install):
+            return 0
+    if args.mitm_ca_install:
+        try:
+            ca.ensure()
+        except RuntimeError as exc:
+            sys.stderr.write(f"[{PROG}] error: {exc}\n")
+            return 2
+        rc = install_ca(ca, color,
+                        stream=sys.stderr if args.mitm and args.format in ("json", "csv") else None)
+        if rc and not args.mitm:
+            return rc
+    if args.mitm_ca_remove:
+        rc = install_ca(ca, color, remove=True,
+                        stream=sys.stderr if args.mitm and args.format in ("json", "csv") else None)
+        if not args.mitm:
+            return rc
+
+    if args.command and not args.mitm:
+        parser.error("a command can only be run with --mitm (put flags before --)")
+    if args.mitm_system and not args.mitm:
+        parser.error("--mitm-system needs --mitm")
+    if args.mitm and not (0 <= args.mitm_port <= 65535):
+        parser.error("--mitm-port must be between 0 and 65535")
+    if args.mitm and args.mitm_timeout <= 0:
+        parser.error("--mitm-timeout must be > 0")
+
     # a few sanity checks that would otherwise fail confusingly mid-capture
     try:
         if args.duration < 0 or args.count < 0 or args.idle <= 0:
@@ -2606,6 +4492,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--duration/--count must be >= 0 and --idle > 0")
     if args.width and args.width < 40:
         parser.error("--width must be at least 40")
+    if args.mitm:
+        return mitm_capture(args, color, ca)
     return capture(args, color)
 
 

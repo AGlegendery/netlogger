@@ -10,13 +10,18 @@ path the live sniffer uses, so no root privileges are required.
 
 import argparse
 import csv
+import http.server
 import io
 import json
 import os
+import queue
+import shutil
 import socket
+import ssl
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -733,6 +738,491 @@ class TestEngineExtras(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("demo mode", out)
         self.assertIn("[GET  ]", out)
+
+
+# --------------------------------------------------------------------------- #
+#  MITM proxy
+# --------------------------------------------------------------------------- #
+
+def _crypto_available() -> bool:
+    try:
+        import cryptography  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class _MitmOrigin(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    body = b"netlogger-mitm-body-" * 64
+    keepalive = False
+
+    def _reply(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        if not self.keepalive:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        if not self.keepalive:
+            self.close_connection = True
+
+    def do_GET(self):  # noqa: N802
+        self._reply(200, self.body, "application/zip")
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        data = self.rfile.read(n)
+        self._reply(201, b"posted:" + data, "text/plain")
+
+    def log_message(self, *_args):
+        pass
+
+
+class _MitmKeepAliveOrigin(_MitmOrigin):
+    keepalive = True
+
+
+def _start_origin(tls_ctx=None, handler=_MitmOrigin):
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    if tls_ctx is not None:
+        httpd.socket = tls_ctx.wrap_socket(httpd.socket, server_side=True)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+def _stop_origin(httpd) -> None:
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def _read_all(sock, timeout: float = 5.0) -> bytes:
+    sock.settimeout(timeout)
+    chunks = []
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except (socket.timeout, ssl.SSLError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_head(sock) -> bytes:
+    out = b""
+    while b"\r\n\r\n" not in out:
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        out += chunk
+    return out
+
+
+def _content_length(head: bytes) -> int:
+    for line in head.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            return int(line.split(b":", 1)[1])
+    return 0
+
+
+def _read_exact(sock, n: int) -> bytes:
+    out = b""
+    while len(out) < n:
+        chunk = sock.recv(n - len(out))
+        if not chunk:
+            break
+        out += chunk
+    return out
+
+
+def _wait_record(q, timeout: float = 5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            kind, rec = q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if kind == "rec":
+            return rec
+    raise AssertionError("no record was emitted")
+
+
+def _mitm_cfg(*extra: str):
+    return nl.build_parser().parse_args(
+        ["--mitm", "--mitm-port", "0", "-q", "--mitm-insecure", *extra])
+
+
+class TestMitmHelpers(unittest.TestCase):
+    def test_split_host_port(self):
+        self.assertEqual(nl.split_host_port("example.com"), ("example.com", 443))
+        self.assertEqual(nl.split_host_port("example.com:8443"), ("example.com", 8443))
+        self.assertEqual(nl.split_host_port("[::1]:9443"), ("::1", 9443))
+        self.assertEqual(nl.split_host_port("[2001:db8::1]"), ("2001:db8::1", 443))
+        self.assertEqual(nl.split_host_port("example.com:bad", 80), ("example.com", 80))
+
+    def test_absolute_target(self):
+        self.assertEqual(nl.absolute_target("https://example.com/a/b?x=1"),
+                         ("https", "example.com", "/a/b?x=1", 443))
+        self.assertEqual(nl.absolute_target("http://example.com:8080/"),
+                         ("http", "example.com", "/", 8080))
+        self.assertEqual(nl.absolute_target("http://[::1]:9000/x?y=2"),
+                         ("http", "::1", "/x?y=2", 9000))
+
+    def test_build_head_drops_proxy_headers_and_adds_host(self):
+        head = nl.build_head(
+            "GET /x HTTP/1.1",
+            [("Proxy-Connection", "keep-alive"), ("X-Test", "1")],
+            host="example.com", default_port=80,
+        )
+        self.assertIn(b"GET /x HTTP/1.1\r\n", head)
+        self.assertNotIn(b"Proxy-Connection", head)
+        self.assertIn(b"Host: example.com:80\r\n", head)
+        self.assertTrue(head.endswith(b"\r\n\r\n"))
+
+    def test_parse_request_and_response(self):
+        method, target, version, hdrs = nl.parse_request_head(
+            b"POST /submit?q=1 HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n")
+        self.assertEqual((method, target, version), ("POST", "/submit?q=1", "HTTP/1.1"))
+        self.assertEqual(nl.header_dict(hdrs)["host"], "h")
+        status, reason, rhdrs = nl.parse_response_head(
+            b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+        self.assertEqual((status, reason), (201, "Created"))
+        self.assertEqual(nl.header_dict(rhdrs)["content-length"], "0")
+
+    def test_body_framing(self):
+        self.assertTrue(nl._body_is_eof(200, {}, "GET"))
+        self.assertFalse(nl._body_is_eof(200, {"content-length": "5"}, "GET"))
+        self.assertFalse(nl._body_is_eof(200, {"transfer-encoding": "chunked"}, "GET"))
+        self.assertFalse(nl._body_is_eof(204, {}, "GET"))
+        self.assertFalse(nl._body_is_eof(200, {}, "HEAD"))
+        self.assertTrue(nl._connection_close("HTTP/1.0", {}))
+        self.assertFalse(nl._connection_close("HTTP/1.1", {}))
+        self.assertTrue(nl._connection_close("HTTP/1.1", {"connection": "close"}))
+
+    def test_mitm_env(self):
+        ca = nl.CertAuthority("/tmp/netlogger-no-such-ca")
+        env = nl.mitm_env(ca, 8080, "127.0.0.1")
+        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:8080")
+        self.assertEqual(env["SSL_CERT_FILE"], ca.cert_path)
+        self.assertIn("NODE_EXTRA_CA_CERTS", env)
+        env6 = nl.mitm_env(ca, 8081, "::1")
+        self.assertEqual(env6["HTTPS_PROXY"], "http://[::1]:8081")
+
+    def test_header_sanitise(self):
+        clean = nl.sanitise_headers([
+            ("Host", "a.example"), ("host", "b.example"),
+            ("Content-Length", "1"), ("content-length", "2"),
+            ("X-Test", "1"), ("X-Test", "2"),
+        ])
+        self.assertEqual(clean, [
+            ("Host", "a.example"), ("Content-Length", "1"),
+            ("X-Test", "1"), ("X-Test", "2"),
+        ])
+
+    def test_request_target_host_ports(self):
+        ca = nl.CertAuthority("/tmp/netlogger-no-such-ca")
+        proxy = nl.MitmProxy(_mitm_cfg(), ca, queue.Queue(), nl.ProcMap())
+        self.assertEqual(proxy._request_target("/x", [("Host", "[::1]:8443")]),
+                         ("http", "::1", "/x", 8443))
+        self.assertEqual(proxy._request_target("/x", [("Host", "example.com:8080")]),
+                         ("http", "example.com", "/x", 8080))
+        self.assertEqual(proxy._request_target("/x", [("Host", "[2001:db8::1]")]),
+                         ("http", "2001:db8::1", "/x", 80))
+
+    def test_record_url_ipv6_port(self):
+        rec = nl.Record(ts=0)
+        rec.method = "GET"
+        rec.scheme = "http"
+        rec.host = "::1"
+        rec.path = "/x"
+        rec.show_port = True
+        rec.server_port = 8080
+        self.assertEqual(rec.url(), "http://[::1]:8080/x")
+
+
+class TestCertAuthority(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("openssl") or _crypto_available(),
+                         "needs cryptography or the openssl CLI")
+    def test_ca_and_leaf(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            self.assertTrue(os.path.isfile(ca.cert_path))
+            self.assertTrue(os.path.isfile(ca.key_path))
+            self.assertEqual(os.stat(ca.key_path).st_mode & 0o777, 0o600)
+            cert, key = ca.leaf_paths("example.com")
+            self.assertTrue(os.path.isfile(cert))
+            self.assertTrue(os.path.isfile(key))
+            self.assertEqual((cert, key), ca.leaf_paths("example.com"))
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            self.assertIsNotNone(ca.leaf_context("example.com"))
+            self.assertRegex(ca.fingerprint(), r"^([0-9A-F]{2}:){31}[0-9A-F]{2}$")
+
+    @unittest.skipUnless(shutil.which("openssl"), "needs the openssl CLI")
+    def test_openssl_backend(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca._backend_name = "openssl"
+            ca.ensure()
+            cert, key = ca.leaf_paths("127.0.0.1")
+            self.assertEqual(os.stat(key).st_mode & 0o777, 0o600)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            self.assertIsNotNone(ca.fingerprint())
+
+
+@unittest.skipUnless(shutil.which("openssl") or _crypto_available(),
+                     "MITM needs cryptography or the openssl CLI")
+class TestMitmProxy(unittest.TestCase):
+    def test_http_get_and_post(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            cfg = _mitm_cfg()
+            origin = _start_origin()
+            proxy = nl.MitmProxy(cfg, ca, queue.Queue(), nl.ProcMap())
+            proxy.start()
+            try:
+                port = origin.server_address[1]
+                q = proxy.out
+                s = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                s.sendall((f"GET http://127.0.0.1:{port}/pkg/thing.zip?token=abc HTTP/1.1\r\n"
+                           f"Host: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").encode())
+                data = _read_all(s)
+                s.close()
+                self.assertIn(b"200 OK", data)
+                self.assertIn(_MitmOrigin.body, data)
+                rec = _wait_record(q)
+                self.assertEqual(rec.method, "GET")
+                self.assertEqual(rec.scheme, "http")
+                self.assertEqual(rec.host, "127.0.0.1")
+                self.assertEqual(rec.path, "/pkg/thing.zip")
+                self.assertEqual(rec.query, "token=abc")
+                self.assertEqual(rec.status, 200)
+                self.assertGreater(rec.bytes_in, len(_MitmOrigin.body))
+
+                payload = b"x" * 5000
+                s = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                s.sendall((f"POST http://127.0.0.1:{port}/submit HTTP/1.1\r\n"
+                           f"Host: 127.0.0.1:{port}\r\nContent-Length: {len(payload)}\r\n"
+                           "Connection: close\r\n\r\n").encode() + payload)
+                data = _read_all(s)
+                s.close()
+                self.assertIn(b"201 Created", data)
+                rec = _wait_record(q)
+                self.assertEqual(rec.method, "POST")
+                self.assertEqual(rec.status, 201)
+                self.assertGreaterEqual(rec.bytes_out, len(payload))
+            finally:
+                proxy.stop()
+                _stop_origin(origin)
+
+    def test_https_interception_full_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            cert, key = ca.leaf_paths("127.0.0.1")
+            sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            sctx.load_cert_chain(cert, key)
+            origin = _start_origin(sctx)
+            cfg = _mitm_cfg()
+            proxy = nl.MitmProxy(cfg, ca, queue.Queue(), nl.ProcMap())
+            proxy.start()
+            try:
+                port = origin.server_address[1]
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                raw.sendall((f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+                             f"Host: 127.0.0.1:{port}\r\n\r\n").encode())
+                head = _read_head(raw)
+                self.assertIn(b"200", head.split(b"\r\n")[0])
+                cctx = ssl.create_default_context(cafile=ca.cert_path)
+                tls = cctx.wrap_socket(raw, server_hostname="127.0.0.1")
+                tls.sendall(b"GET /files/linux.iso?mirror=eu HTTP/1.1\r\n"
+                            b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                data = _read_all(tls)
+                tls.close()
+                self.assertIn(b"200 OK", data)
+                self.assertIn(_MitmOrigin.body, data)
+                rec = _wait_record(proxy.out)
+                self.assertEqual(rec.method, "GET")
+                self.assertEqual(rec.scheme, "https")
+                self.assertEqual(rec.host, "127.0.0.1")
+                self.assertEqual(rec.path, "/files/linux.iso")
+                self.assertEqual(rec.query, "mirror=eu")
+                self.assertEqual(rec.status, 200)
+                self.assertTrue(rec.tls.startswith("1."))
+                self.assertEqual(rec.sni, "127.0.0.1")
+                self.assertIn("https://127.0.0.1:", rec.url())
+            finally:
+                proxy.stop()
+                _stop_origin(origin)
+
+    def test_tls_keepalive_two_requests_one_connection(self):
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            cert, key = ca.leaf_paths("127.0.0.1")
+            sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            sctx.load_cert_chain(cert, key)
+            origin = _start_origin(sctx, _MitmKeepAliveOrigin)
+            cfg = _mitm_cfg()
+            proxy = nl.MitmProxy(cfg, ca, queue.Queue(), nl.ProcMap())
+            proxy.start()
+            try:
+                port = origin.server_address[1]
+                raw = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                raw.sendall((f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
+                             f"Host: 127.0.0.1:{port}\r\n\r\n").encode())
+                self.assertIn(b"200", _read_head(raw).split(b"\r\n")[0])
+                cctx = ssl.create_default_context(cafile=ca.cert_path)
+                tls = cctx.wrap_socket(raw, server_hostname="127.0.0.1")
+                for path in ("/one", "/two"):
+                    tls.sendall((f"GET {path} HTTP/1.1\r\n"
+                                 f"Host: 127.0.0.1:{port}\r\n"
+                                 "Connection: keep-alive\r\n\r\n").encode())
+                    head = _read_head(tls)
+                    self.assertIn(b"200 OK", head)
+                    body = _read_exact(tls, _content_length(head))
+                    self.assertEqual(body, _MitmOrigin.body)
+                tls.close()
+                paths = [_wait_record(proxy.out).path for _ in range(2)]
+                self.assertEqual(paths, ["/one", "/two"])
+            finally:
+                proxy.stop()
+                _stop_origin(origin)
+
+    def test_non_tls_connect_is_tunnelled(self):
+        echo = socket.socket()
+        echo.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        echo.bind(("127.0.0.1", 0))
+        echo.listen(1)
+        echo_port = echo.getsockname()[1]
+
+        def echo_loop():
+            conn, _ = echo.accept()
+            with conn:
+                while True:
+                    data = conn.recv(65536)
+                    if not data:
+                        break
+                    conn.sendall(data)
+
+        threading.Thread(target=echo_loop, daemon=True).start()
+        with tempfile.TemporaryDirectory() as td:
+            ca = nl.CertAuthority(td)
+            ca.ensure()
+            cfg = _mitm_cfg()
+            proxy = nl.MitmProxy(cfg, ca, queue.Queue(), nl.ProcMap())
+            proxy.start()
+            try:
+                s = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+                s.sendall((f"CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n"
+                           f"Host: 127.0.0.1:{echo_port}\r\n\r\n").encode())
+                self.assertIn(b"200", _read_head(s).split(b"\r\n")[0])
+                s.sendall(b"ping-pong")
+                got = b""
+                while len(got) < 9:
+                    chunk = s.recv(9 - len(got))
+                    if not chunk:
+                        break
+                    got += chunk
+                self.assertEqual(got, b"ping-pong")
+                s.close()
+                rec = _wait_record(proxy.out)
+                self.assertEqual(rec.method, "CONNECT")
+                self.assertEqual(rec.app, "TCP")
+                self.assertTrue(any("not TLS" in n for n in (rec.notes or [])))
+                self.assertGreaterEqual(rec.bytes_out, 9)
+                self.assertGreaterEqual(rec.bytes_in, 9)
+            finally:
+                proxy.stop()
+                echo.close()
+
+
+class TestSystemProxy(unittest.TestCase):
+    FAKE = '''#!/usr/bin/env python3
+import json, os, sys
+db = os.environ["GSETTINGS_FAKE_DB"]
+try:
+    data = json.load(open(db))
+except Exception:
+    data = {}
+defaults = {
+    ("org.gnome.system.proxy", "mode"): "'none'",
+    ("org.gnome.system.proxy.http", "host"): "''",
+    ("org.gnome.system.proxy.http", "port"): "0",
+    ("org.gnome.system.proxy.https", "host"): "''",
+    ("org.gnome.system.proxy.https", "port"): "0",
+    ("org.gnome.system.proxy", "ignore-hosts"): "['localhost']",
+}
+argv = sys.argv[1:]
+if not argv:
+    sys.exit(2)
+if argv[0] == "get":
+    key = (argv[1], argv[2])
+    print(data.get(f"{key[0]} {key[1]}", defaults.get(key, "")))
+elif argv[0] == "set":
+    data[f"{argv[1]} {argv[2]}"] = " ".join(argv[3:])
+    json.dump(data, open(db, "w"))
+else:
+    sys.exit(2)
+'''
+
+    @unittest.skipIf(os.geteuid() == 0 and os.environ.get("SUDO_USER"),
+                     "would try to switch to the desktop user")
+    def test_set_and_restore(self):
+        with tempfile.TemporaryDirectory() as td:
+            bindir = Path(td) / "bin"
+            bindir.mkdir()
+            fake = bindir / "gsettings"
+            fake.write_text(self.FAKE, encoding="utf-8")
+            fake.chmod(0o755)
+            db = Path(td) / "db.json"
+            old_path = os.environ.get("PATH", "")
+            old_db = os.environ.get("GSETTINGS_FAKE_DB")
+            os.environ["PATH"] = str(bindir) + ":" + old_path
+            os.environ["GSETTINGS_FAKE_DB"] = str(db)
+            try:
+                before = {name: nl._gsettings(spec)[1].strip()
+                          for name, spec in nl.PROXY_KEYS}
+                state, ok = nl.set_system_proxy(td, "127.0.0.1", 8080)
+                self.assertTrue(ok)
+                self.assertTrue(os.path.isfile(state))
+                with open(state, encoding="utf-8") as fh:
+                    first_state = json.load(fh)["values"]
+                self.assertEqual(first_state, before)
+                # calling it again must keep the original values, not capture our proxy
+                state2, ok2 = nl.set_system_proxy(td, "127.0.0.1", 8080)
+                self.assertTrue(ok2)
+                self.assertEqual(state2, state)
+                with open(state, encoding="utf-8") as fh:
+                    self.assertEqual(json.load(fh)["values"], before)
+                during = {name: nl._gsettings(spec)[1].strip()
+                          for name, spec in nl.PROXY_KEYS}
+                self.assertEqual(during["mode"], "'manual'")
+                self.assertEqual(during["http_port"], "8080")
+                self.assertIn("127.0.0.1", during["ignore_hosts"])
+                self.assertIn("::1", during["ignore_hosts"])
+                old_out = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    self.assertTrue(nl.restore_system_proxy(td))
+                finally:
+                    sys.stdout = old_out
+                after = {name: nl._gsettings(spec)[1].strip()
+                         for name, spec in nl.PROXY_KEYS}
+                self.assertEqual(after, before)
+                self.assertFalse(os.path.exists(state))
+            finally:
+                os.environ["PATH"] = old_path
+                if old_db is None:
+                    os.environ.pop("GSETTINGS_FAKE_DB", None)
+                else:
+                    os.environ["GSETTINGS_FAKE_DB"] = old_db
 
 
 if __name__ == "__main__":
